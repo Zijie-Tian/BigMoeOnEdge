@@ -24,20 +24,20 @@ BMOE_PROGRESS {"step":<int>,"steps":<int>,"wall_ms":<float>,"io_ms":<float>,
   measured quantity**: no clock runs around llama.cpp's matmul kernels in a normal run, so compute
   is whatever wall time is left after the measured terms are subtracted — `wall_ms − io_ms −
   mgmt_ms` in serial, `wall_ms − stall_ms − mgmt_ms` under overlap. When that residual is the
-  number in question, `--compute-trace` measures it directly instead (see [Decode
-  traces](#decode-traces)) — at a cost that makes it a diagnostic, not telemetry.
+  number in question, `--compute-trace` records graph-node elapsed intervals instead (see
+  [Decode traces](#decode-traces)). These include synchronization, scheduling and expert waits,
+  not just arithmetic, and tracing makes the run a diagnostic rather than a benchmark.
   `compute_ms` is **clamped at 0** — a negative compute would be nonsense. That clamp means the
   wall-additive identity is not exact in the pathological case — a consumer that recovers the
   flash-wait term as `wall_ms − compute_ms − mgmt_ms` gets `wall_ms − mgmt_ms` when the clamp
   fires, over-attributing to flash. Read the wall-additive flash term straight from `io_ms`
   (serial) / `stall_ms` (overlap) instead of inverting the residual.
   `stall_ms` is the **union of stalled intervals**: the cumulative wall time during which at least
-  one compute thread was blocked on a streamed expert. Overlapping waits count once, so it is the
-  critical-path quantity — one blocked thread already means the graph is not progressing. (It was
-  previously the summed per-thread block time divided by `n_threads`, a mean that equaled the wall
-  stall only if every compute thread blocked together and understated it whenever a minority of
-  threads did the waiting — with the difference silently landing in `compute_ms`.) The interval
-  opens the moment a thread finds its expert unready — including the short pre-block spin — and a
+  one compute thread was waiting for a streamed expert. Overlapping waits count once. This is an
+  **any-worker wait**, not evidence that all compute threads were idle: other workers can still
+  make progress during the same interval. (It was previously the summed per-thread block time
+  divided by `n_threads`, which could understate the union whenever only a minority waited.)
+  The interval opens the moment a thread finds its expert unready — including the short pre-block spin — and a
   stats snapshot taken mid-stall includes the open interval up to now. Attribution between compute
   and flash is still approximate (see `--compute-trace` when the split itself is the question), but
   the flash term no longer depends on how the waiting was distributed across threads.
@@ -598,26 +598,41 @@ Both work in `--session` mode too, appending across turns like the per-token CSV
 ### `--compute-trace` — one row per graph node
 
 Returning `true` from the eval callback makes ggml compute exactly up to that node, synchronize,
-and call back — so the wall delta between consecutive boundaries is that node's real compute time,
-measured, not inferred. The same boundaries sample major faults, which is the point: on a >RAM
-model most of "compute" is flash faults, and no residual can show that. The cost is a barrier per
-node and no operator coalescing, so the total is inflated well above an untraced run.
+and call back. In trace v2, a node interval starts after its `ask` callback and ends before its
+`observe` callback. Serial expert loading therefore belongs to callback work, not to the next
+kernel. Node elapsed time includes backend scheduling, thread synchronization and any
+expert-ready waits inside the kernel; it is **not pure thread CPU time**. The same boundaries
+sample major faults. Per-node isolation and recording add overhead, so compare an untraced
+control before interpreting throughput.
 
 Unlike the other traces this one does **not** need `--moe-stream`: it times the graph, which a
 plain mmap run has too, so a dense baseline can be traced and compared against a streamed one.
 
+Both v2 traces use nanoseconds from `std::chrono::steady_clock::time_since_epoch()` in the same
+process. Their shared nonzero `trace_id` identifies one model session; do not pair different
+sessions or interpret these timestamps as wall-clock dates. A schema example:
+
 ```
-# compute_trace v1
-# model=... arch=qwen3moe n_layer=48 n_threads=4 io_threads=4 o_direct=1 overlap=0
-turn,phase,step,seq,layer,op,name,wall_ns,majflt
-0,1,29,0,-1,GET_ROWS,embd,428500,0
-0,1,29,1,0,RMS_NORM,norm-0,19500,0
+# compute_trace v2
+# model=model.gguf arch=qwen3moe n_layer=48 n_threads=32 io_threads=2 o_direct=1 overlap=0
+# clock=steady_ns trace_id=1000
+turn,phase,step,seq,layer,op,name,wall_ns,majflt,start_ns,end_ns
+0,1,29,0,-1,BMOE_DECODE,decode,500000,0,1000000,1500000
+0,1,29,1,-1,BMOE_CALLBACK,ask,1000,0,1000000,1001000
+0,1,29,2,-1,GET_ROWS,embd,428500,0,1001000,1429500
 ```
 
-`seq` is the node's execution order in the decode; `layer` is parsed from the node name's `-<il>`
-suffix (`-1` = belongs to no layer: embeddings, the output head, masks). `op` and `name` are raw —
-which node is attention vs dense FFN vs expert matmul is naming policy that varies by
-architecture, so the engine reports what the graph said and the analysis script classifies.
+`wall_ns = end_ns - start_ns`. `seq` orders trace events within a decode, including:
+
+- **`BMOE_DECODE`**: the complete `begin_compute_batch` / `end_compute_batch` frame. This is an
+  enclosing interval, not another graph operation; never add it to node time.
+- **`BMOE_CALLBACK`**: `ask` or `observe` callback work, including cache bookkeeping and serial
+  expert-load waits. Emitted in per-node mode, separately from the graph-node intervals.
+- **ggml operations**: the operation and tensor name reported by the graph. `MUL_MAT_ID` is an
+  expert-matmul node over the selected experts, **not one expert's individual compute span**.
+
+`layer` is parsed from the node name's `-<il>` suffix (`-1` for embeddings, the output head and
+other layerless nodes). Callback rows carry their associated node's layer.
 
 ### `--compute-trace-layers` — one row per layer segment
 
@@ -629,28 +644,40 @@ prefetch: the io lanes keep reading across a boundary, so the traced numbers sit
 untraced run and can be compared across models. The trade is per-op detail: a row aggregates
 everything since the previous boundary.
 
-Rows share the per-node schema with `op` fixed to `LAYER`. `name` says which segment: `blk.<il>`
-is layer il's, `pre` is the embedding lookup before layer 0, and `post` — emitted when the batch
-closes — is the last layer's tail plus the final norm and LM head. The routing nodes the streamer
-isolates anyway also close a segment (a barrier that exists untraced too, so it costs nothing
-extra); those rows carry the same `blk.<il>` name and simply sum into their layer.
+Rows share the per-node schema. `BMOE_DECODE` still encloses the whole frame; the remaining rows
+have `op=LAYER`, with no separate callback rows. `name` says which segment: `blk.<il>` is layer
+il's, `pre` precedes layer 0, and `post` closes the last layer's tail plus the final norm and LM
+head. Routing boundaries can split a layer into several segments. These are **coarse elapsed
+segments including callback/load work**, not isolated kernel measurements.
 `scripts/decode-analyze.py compute` detects the granularity and prints the per-segment table.
 
-### `--io-trace` — one row per flash read
+### `--io-trace` — reads and expert-readiness waits
 
-Needs `--moe-stream` (no engine-issued reads without it). Records every `pread` the streamer
-issues, tagged with the `(layer, expert, projection)` it serves.
+Needs `--moe-stream` (no engine-issued reads without it). Records the expert streamer's
+`FileReader::read` intervals and, under overlap, each compute thread's unmet-ready interval.
 
 ```
-# io_trace v1
-turn,phase,step,layer,expert,proj,lane,spec,offset,req_bytes,read_bytes,latency_ns
-0,1,29,0,87,1,0,0,1526304,65536,69632,416800
+# io_trace v2
+# model=model.gguf arch=qwen3moe n_layer=48 n_threads=32 io_threads=2 o_direct=1 overlap=1
+# clock=steady_ns trace_id=1000
+turn,phase,step,layer,expert,proj,lane,spec,offset,req_bytes,read_bytes,latency_ns,start_ns,end_ns,kind,thread_id
+0,1,29,0,87,1,0,0,1526304,65536,69632,416800,1000000,1416800,read,1
+0,1,29,0,87,1,-1,0,0,0,0,317000,1100000,1417000,wait,2
 ```
 
-`req_bytes` is what the caller wanted; `read_bytes` is the aligned window actually pulled — the
-gap is O_DIRECT alignment waste, and `read_bytes` is what effective bandwidth must be judged
-against. `spec=1` marks a speculative prefetch read. Rows are stamped with the decode they were
-drained after, so a read straddling a token boundary is attributed to the decode that flushed it.
+- **`kind=read`**: includes alignment handling and the bounce-buffer copy as well as positioned
+  reads. It is a reader-service interval, **not storage-device-only time**. `lane` identifies the
+  reader lane; `req_bytes` is the requested slice and `read_bytes` is the aligned window.
+- **`kind=wait`**: one compute thread found a projection of an expert unready. Includes its
+  short spin and any condition-variable wait. `lane=-1`, byte counts are zero, and
+  `(layer, expert, proj)` identifies the dependency. Ready hits emit no wait.
+- `latency_ns = end_ns - start_ns`; `thread_id` is a stable numeric thread identifier within
+  the process. Cache hits issue no read. `spec=1` marks speculative reads.
+
+Rows retain the decode frame that drained them, as before. A speculative read can cross a frame
+boundary, so timelines clip intervals by their timestamps rather than trusting the row's `step`.
+Parallel reads and worker waits overlap: sum their **interval union** for wall-time attribution,
+not their individual durations. Any-worker wait union does not mean all workers are idle.
 
 ### Reading them
 
@@ -661,3 +688,42 @@ scripts/decode-analyze.py compute ct.csv --layers   # share by op, fault attribu
 scripts/decode-analyze.py io io.csv --adjacent      # latency percentiles, size/bandwidth, lanes,
                                                     # and the coalescing ceiling
 ```
+
+To draw a **measured** timeline and write interval-union statistics:
+
+```bash
+build/cli/bmoe-cli -m model.gguf --moe-stream --dense-weights anon \
+  --cache-mb 2000 --io-threads 2 -t 32 -n 32 --overlap \
+  --compute-trace compute.csv --io-trace io.csv --csv metrics.csv
+python3 scripts/decode-analyze.py timeline compute.csv --io io.csv \
+  --svg timeline.svg --summary timeline.json
+```
+
+The timeline requires v2 timestamps, matching `trace_id` values and `BMOE_DECODE` frames; it
+refuses to invent chronology from v1 duration-only files. The older `compute` and `io` summary
+commands still read existing v1 evidence; synthetic frame/callback rows and `kind=wait` rows
+are excluded from their ordinary operation/read totals.
+
+By default the SVG shows the first decode frame and JSON aggregates decode frames. Use
+`--phase 0` for prefill, `--turn N` for a session turn, or `--step N` to limit both the plot and
+summary to one frame. `--layer N` zooms the plot without changing the whole-frame summary.
+SVG tooltips retain operation names and each read's layer, expert, projection and timestamps.
+
+The summary distinguishes `graph_wall_ms`, `callback_wall_ms`, `expert_wait_union_ms`,
+`read_busy_union_ms` and summed lane time `read_busy_sum_ms`. `graph_nonwait_ms` removes
+any-worker wait intervals from graph intervals, so it is **not** a measure of pure arithmetic
+or summed compute-thread CPU time. `read_graph_nonwait_overlap_ms` explicitly reports overlap.
+These quantities are not a disjoint percentage partition and must not be forced to total 100%.
+For layer traces, graph intervals are the broader layer segments described above.
+
+For a host-side edge-workflow experiment, use a fixed expert cache smaller than the expert
+weight set, O_DIRECT, and an explicit compute-thread count/CPU affinity. This exercises misses,
+loads and evictions without claiming to emulate a phone's CPU, memory pressure or flash
+bandwidth. A small synthetic fixture may need `--force-cache` to use a proportionately small
+budget. Keep its results separate from real-model/device benchmarks, and record an untraced
+control to expose tracing overhead.
+
+The standalone `io` summary only observes frames that issued reads. Its averages are therefore
+labelled **per read-active frame**, not per generated token. Fully cached frames are absent from
+that CSV; the paired `timeline` command uses `BMOE_DECODE` frames to include them in full-run
+averages.

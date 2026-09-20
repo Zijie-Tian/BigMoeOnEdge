@@ -228,25 +228,24 @@ public:
 
     // ── compute trace (diagnostics; see bmoe/decode_trace.h) ────────────────────────
     // When on, the hook asks for EVERY node, which makes ggml compute and synchronize each one
-    // alone — so the wall delta between consecutive callbacks is that node's real compute time,
-    // and the major-fault delta across it is the flash re-read that time was actually spent on.
-    // This is the only way to measure compute from outside llama.cpp, and it is expensive by
-    // construction: a barrier per node, and no operator coalescing. Off by default; a traced run
-    // is not a benchmark run. Independent of streaming — a dense baseline can be traced too.
+    // alone. v2 timestamps bracket a node AFTER ask-side callback work and BEFORE observe-side
+    // callback work (BMOE_CALLBACK rows cover ask/observe, including cache/load). Off by default;
+    // a traced run is not a benchmark run. Independent of streaming — a dense baseline can be
+    // traced too.
     //
     // per_layer trades the per-op detail for fidelity: only the first node of each layer is
     // isolated (~n_layer barriers per token instead of thousands), coalescing and the async
-    // expert prefetch survive, and each row aggregates one layer's segment (op "LAYER").
+    // expert prefetch survive, and each row aggregates one layer's segment (op "LAYER"), which
+    // includes callback work (broader than per-node).
     void set_compute_trace(bool on, bool per_layer = false);
 
     // Frame the rows of one llama_decode, as begin_trace_batch does for the route trace. Rows are
     // stamped with `step`; a prefill chunk attributes its whole graph to the batch's last position,
-    // since a node is computed once for the batch, not per token.
+    // since a node is computed once for the batch, not per token. Opens the BMOE_DECODE span.
     void begin_compute_batch(int step, int phase, int turn);
 
-    // Close the batch's final interval (layer-granularity only): the last layer's tail plus the
-    // final norm and LM head have no successor boundary to observe them, so the session must call
-    // this right after llama_decode returns — the row is charged the wall since the last boundary.
+    // Close the BMOE_DECODE span. Layer granularity also emits "post" (last layer's tail plus the
+    // final norm and LM head). The session must call this right after llama_decode returns.
     void end_compute_batch();
 
     std::vector<ComputeTraceRow> & compute_rows() { return compute_rows_; }
@@ -281,6 +280,8 @@ private:
     void apply_substitute(ggml_tensor * ids, int il, int nu, int nt);
     void close_drop_layer();
     void ctrace_close_segment(int interval_layer, const char * tail_name);
+    void
+    ctrace_emit(const char * op, const char * name, int layer, uint64_t start_ns, uint64_t end_ns, uint64_t majflt);
 
     // Stored by value, not by reference: the caller often constructs us from a temporary
     // (a `cond ? *ptr : MoeRecipe{}` ternary yields a prvalue even when ptr is non-null),
@@ -517,19 +518,24 @@ private:
     std::vector<RouteTraceRow> trace_rows_;
     std::unordered_set<int32_t> charged_; // per-flush scratch: experts already charged for a read
 
-    // Compute trace. All of this is inert unless ctrace_on_. `ctrace_mark_` is the previous
-    // isolation boundary: the node reported by the next callback is charged the wall since it.
-    // Layer granularity keeps two cursors because ask and observe see different node streams:
-    // ask_layer_ decides which nodes to isolate (every node is asked), obs_layer_ names the
-    // segment an observed interval belongs to (only isolated nodes are observed). -1 = before
-    // layer 0, i.e. the "pre" segment.
+    // Compute trace. All of this is inert unless ctrace_on_. Per-node mode brackets nodes in
+    // c_eval so ask/observe callback work is BMOE_CALLBACK, not the next kernel. Layer mode
+    // keeps interval-between-boundaries semantics (callback work included). `ctrace_mark_ns_`
+    // is the previous LAYER boundary. Ask/observe cursors: ask_layer_ decides which nodes to
+    // isolate, obs_layer_ names the segment an observed interval belongs to. -1 = "pre".
     bool ctrace_on_ = false;
     bool ctrace_layers_ = false;
     int ctrace_ask_layer_ = -1, ctrace_obs_layer_ = -1;
     int ctrace_step_ = 0, ctrace_phase_ = 0, ctrace_turn_ = 0;
     int ctrace_seq_ = 0;
-    std::chrono::steady_clock::time_point ctrace_mark_;
+    uint64_t ctrace_mark_ns_ = 0;
     uint64_t ctrace_faults_ = 0;
+    uint64_t ctrace_decode_faults_ = 0;
+    size_t ctrace_decode_row_ = (size_t) -1;
+    bool ctrace_have_node_ = false;
+    uint64_t ctrace_node_start_ns_ = 0;
+    uint64_t ctrace_node_faults_ = 0;
+    ggml_tensor * ctrace_node_t_ = nullptr;
     std::vector<ComputeTraceRow> compute_rows_;
 };
 

@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <thread>
 #include <utility>
 
@@ -306,30 +307,42 @@ bool ExpertStreamSource::reopen_readers() {
 
 // ── one aligned slice read on a lane ────────────────────────────────────────────────
 // The bytes come from the reader; this wraps it with the domain the reader must not know about — the
-// per-read I/O trace that attributes a read to its (layer, expert, projection). Latency is timed here
-// so the row carries this read's own cost, not the reader's running total.
+// per-read I/O trace that attributes a read to its (layer, expert, projection). End timestamp is
+// taken before the trace-buffer lock so lock wait is not billed as I/O.
+static uint64_t io_trace_thread_id() {
+    const uint64_t id = (uint64_t) std::hash<std::thread::id>{}(std::this_thread::get_id());
+    return id ? id : 1ull;
+}
+
+void ExpertStreamSource::emit_io_trace(const IoTraceRow & r) {
+    std::lock_guard<std::mutex> lk(io_trace_mtx_);
+    io_trace_rows_.push_back(r);
+}
+
 bool ExpertStreamSource::read_slice(int lane, const IoJob & j) {
     if (j.nbytes == 0) return true;
-    const auto t0 = clock_t_::now();
+    if (!io_trace_on_) return readers_[(size_t) j.file]->read(lane, j.dst, j.off, j.nbytes) >= 0;
+
+    const uint64_t start_ns = decode_trace_now_ns();
     const long long window = readers_[(size_t) j.file]->read(lane, j.dst, j.off, j.nbytes);
+    const uint64_t end_ns = decode_trace_now_ns();
     if (window < 0) return false;
 
-    if (io_trace_on_) {
-        const uint64_t lat_ns =
-            (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t_::now() - t0).count();
-        IoTraceRow r;
-        r.layer = j.layer;
-        r.expert = j.expert;
-        r.proj = (int8_t) j.proj;
-        r.lane = (int8_t) lane;
-        r.spec = j.spec;
-        r.offset = j.off;
-        r.req_bytes = j.nbytes;
-        r.read_bytes = (uint64_t) window; // the aligned window pulled — what bandwidth is judged against
-        r.latency_ns = lat_ns;
-        std::lock_guard<std::mutex> lk(io_trace_mtx_);
-        io_trace_rows_.push_back(r);
-    }
+    IoTraceRow r;
+    r.layer = j.layer;
+    r.expert = j.expert;
+    r.proj = (int8_t) j.proj;
+    r.lane = (int8_t) lane;
+    r.spec = j.spec;
+    r.offset = j.off;
+    r.req_bytes = j.nbytes;
+    r.read_bytes = (uint64_t) window; // the aligned window pulled — what bandwidth is judged against
+    r.start_ns = start_ns;
+    r.end_ns = end_ns;
+    r.latency_ns = end_ns >= start_ns ? end_ns - start_ns : 0;
+    r.kind = "read";
+    r.thread_id = io_trace_thread_id();
+    emit_io_trace(r);
     return true;
 }
 
@@ -337,12 +350,13 @@ void ExpertStreamSource::set_io_trace(bool on) {
     std::lock_guard<std::mutex> lk(io_trace_mtx_);
     io_trace_on_ = on;
     io_trace_rows_.clear();
+    if (on) io_trace_rows_.reserve(1024);
 }
 
 void ExpertStreamSource::take_io_trace_rows(std::vector<IoTraceRow> & out) {
     std::lock_guard<std::mutex> lk(io_trace_mtx_);
     out.swap(io_trace_rows_);
-    io_trace_rows_.clear();
+    io_trace_rows_.clear(); // keep capacity of the swapped-in buffer
 }
 
 void ExpertStreamSource::io_drain(int lane, uint64_t my_gen) {
@@ -1337,19 +1351,42 @@ void ExpertStreamSource::on_expert_ready(const ggml_tensor * src0, int expert) {
     }
     const size_t idx = (size_t) p * (size_t) n_expert_ + (size_t) expert;
     const uint32_t want = async_gen_.load(std::memory_order_relaxed);
-    if (ready_[idx].gen.load(std::memory_order_acquire) == want) return; // already resident
+    if (ready_[idx].gen.load(std::memory_order_acquire) == want) return; // already resident — no wait row
 
     // The stall interval opens the moment the need is unmet — before the spin, since the spin is
     // already waiting — and closes on whichever exit this thread takes. Union accounting, not a
-    // per-thread sum: see StallUnion.
+    // per-thread sum: see StallUnion. One I/O-trace wait row is published on that same exit, never
+    // on a ready hit. The trace lock is not held across the wait (or taken with ready_mtx_).
     stall_union_.enter();
+    const bool tracing = io_trace_on_;
+    const uint64_t wait_start = tracing ? decode_trace_now_ns() : 0;
+    auto finish_wait = [&]() {
+        stall_union_.exit();
+        if (!tracing) return;
+        const uint64_t wait_end = decode_trace_now_ns();
+        IoTraceRow r;
+        r.layer = il;
+        r.expert = expert;
+        r.proj = (int8_t) p;
+        r.lane = -1;
+        r.spec = 0;
+        r.offset = 0;
+        r.req_bytes = 0;
+        r.read_bytes = 0;
+        r.start_ns = wait_start;
+        r.end_ns = wait_end;
+        r.latency_ns = wait_end >= wait_start ? wait_end - wait_start : 0;
+        r.kind = "wait";
+        r.thread_id = io_trace_thread_id();
+        emit_io_trace(r);
+    };
     // Short spin first: a slice usually lands within microseconds, cheaper than a syscall. The
     // beat is a pause instruction, not yield() — 2048 yields burnt up to a millisecond of
     // sched_yield churn per genuinely slow slice, stealing CPU from the I/O lanes and the
     // sibling compute threads that would have finished the slice sooner.
     for (int s = 0; s < 256; ++s) {
         if (ready_[idx].gen.load(std::memory_order_acquire) == want || fatal_.load(std::memory_order_acquire)) {
-            stall_union_.exit();
+            finish_wait();
             return;
         }
         cpu_relax();
@@ -1367,7 +1404,7 @@ void ExpertStreamSource::on_expert_ready(const ggml_tensor * src0, int expert) {
         });
     }
     ready_waiters_.fetch_sub(1, std::memory_order_seq_cst);
-    stall_union_.exit();
+    finish_wait();
 }
 
 void ExpertStreamSource::enable_overlap_hook() {

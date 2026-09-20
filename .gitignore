@@ -2,6 +2,7 @@
 /build*/
 /out/
 cmake-build-*/
+.cache/
 
 # OpenCL headers + ICD loader, fetched by scripts/fetch-opencl-android.ps1 for the optional
 # GPU build. Third-party sources we do not vendor: a build prerequisite, not our code.
@@ -46,6 +47,9 @@ Thumbs.db
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .venv/
 
 # Android release signing — secrets, never commit (repo is written to be opened)

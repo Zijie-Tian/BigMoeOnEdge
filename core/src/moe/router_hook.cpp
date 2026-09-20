@@ -1262,8 +1262,35 @@ void RouterHook::flush_pending() {
     P.nu = P.nt = 0;
 }
 
+static int node_layer(const char * name);
+
 bool RouterHook::c_eval(ggml_tensor * t, bool ask, void * user_data) {
-    return static_cast<RouterHook *>(user_data)->on_eval(t, ask);
+    RouterHook * self = static_cast<RouterHook *>(user_data);
+    // Per-node trace: this wrapper is the single exit boundary. Node spans begin after ask-side
+    // on_eval returns and end before observe-side on_eval runs, so serial load/cache work is a
+    // BMOE_CALLBACK row, not the next kernel. Layer mode keeps on_eval's broader semantics.
+    if (!self->ctrace_on_ || self->ctrace_layers_) return self->on_eval(t, ask);
+
+    const uint64_t t0 = decode_trace_now_ns();
+    const uint64_t f0 = pio::major_faults();
+    if (!ask && self->ctrace_have_node_) {
+        ggml_tensor * nt = self->ctrace_node_t_ ? self->ctrace_node_t_ : t;
+        self->ctrace_emit(ggml_op_name(nt->op), nt->name, node_layer(nt->name), self->ctrace_node_start_ns_, t0,
+                          f0 - self->ctrace_node_faults_);
+        self->ctrace_have_node_ = false;
+        self->ctrace_node_t_ = nullptr;
+    }
+    const bool rec = self->on_eval(t, ask);
+    const uint64_t t1 = decode_trace_now_ns();
+    const uint64_t f1 = pio::major_faults();
+    self->ctrace_emit("BMOE_CALLBACK", ask ? "ask" : "observe", node_layer(t->name), t0, t1, f1 - f0);
+    if (ask && rec) {
+        self->ctrace_node_start_ns_ = t1;
+        self->ctrace_node_faults_ = f1;
+        self->ctrace_node_t_ = t;
+        self->ctrace_have_node_ = true;
+    }
+    return rec;
 }
 
 // Layer id from a node name. llama.cpp suffixes per-layer nodes with "-<il>"; anything else
@@ -1281,6 +1308,10 @@ void RouterHook::set_compute_trace(bool on, bool per_layer) {
     ctrace_on_ = on;
     ctrace_layers_ = per_layer;
     compute_rows_.clear();
+    ctrace_have_node_ = false;
+    ctrace_node_t_ = nullptr;
+    ctrace_decode_row_ = (size_t) -1;
+    if (on) compute_rows_.reserve(4096);
 }
 
 void RouterHook::begin_compute_batch(int step, int phase, int turn) {
@@ -1290,72 +1321,83 @@ void RouterHook::begin_compute_batch(int step, int phase, int turn) {
     ctrace_seq_ = 0;
     ctrace_ask_layer_ = -1;
     ctrace_obs_layer_ = -1;
-    // The first node of the graph is charged from here, so the mark must be taken as close to
-    // llama_decode as the caller can manage — anything between them lands on node 0.
-    ctrace_mark_ = std::chrono::steady_clock::now();
+    ctrace_have_node_ = false;
+    ctrace_node_t_ = nullptr;
+    const uint64_t now = decode_trace_now_ns();
+    ctrace_mark_ns_ = now;
     ctrace_faults_ = pio::major_faults();
+    ctrace_decode_faults_ = ctrace_faults_;
+    ctrace_emit("BMOE_DECODE", "decode", -1, now, 0, 0);
+    ctrace_decode_row_ = compute_rows_.size() - 1;
 }
 
-// Layer granularity: emit the closing row for the segment `interval_layer`, charged the wall
-// and faults since the previous boundary. Shared by the observe path and end_compute_batch.
-void RouterHook::ctrace_close_segment(int interval_layer, const char * tail_name) {
-    const auto now = std::chrono::steady_clock::now();
-    const uint64_t faults = pio::major_faults();
+void RouterHook::ctrace_emit(
+    const char * op, const char * name, int layer, uint64_t start_ns, uint64_t end_ns, uint64_t majflt) {
     ComputeTraceRow r;
     r.turn = ctrace_turn_;
     r.phase = ctrace_phase_;
     r.step = ctrace_step_;
     r.seq = ctrace_seq_++;
-    r.layer = interval_layer;
-    r.op = "LAYER";
-    r.name = tail_name ? tail_name : (interval_layer < 0 ? "pre" : "blk." + std::to_string(interval_layer));
-    r.wall_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(now - ctrace_mark_).count();
-    r.majflt = faults - ctrace_faults_;
+    r.layer = layer;
+    r.op = op ? op : "";
+    r.name = name ? name : "";
+    r.start_ns = start_ns;
+    r.end_ns = end_ns;
+    r.wall_ns = end_ns >= start_ns ? end_ns - start_ns : 0;
+    r.majflt = majflt;
     compute_rows_.push_back(std::move(r));
-    ctrace_mark_ = now;
+}
+
+// Layer granularity: emit the closing row for the segment `interval_layer`, charged the wall
+// and faults since the previous boundary. Shared by the observe path and end_compute_batch.
+void RouterHook::ctrace_close_segment(int interval_layer, const char * tail_name) {
+    const uint64_t now = decode_trace_now_ns();
+    const uint64_t faults = pio::major_faults();
+    const std::string name = tail_name
+                                 ? std::string(tail_name)
+                                 : (interval_layer < 0 ? std::string("pre") : "blk." + std::to_string(interval_layer));
+    ctrace_emit("LAYER", name.c_str(), interval_layer, ctrace_mark_ns_, now, faults - ctrace_faults_);
+    ctrace_mark_ns_ = now;
     ctrace_faults_ = faults;
 }
 
 void RouterHook::end_compute_batch() {
-    // Node granularity has no dangling interval: the last node was itself isolated and observed.
-    // The tail row absorbs whatever ran between the last boundary and this call — keep the call
-    // adjacent to llama_decode's return or the decode epilogue is billed to the LM head.
-    if (!ctrace_on_ || !ctrace_layers_) return;
-    ctrace_close_segment(-1, "post");
+    if (!ctrace_on_) return;
+    if (ctrace_have_node_ && ctrace_node_t_) {
+        const uint64_t now = decode_trace_now_ns();
+        const uint64_t faults = pio::major_faults();
+        ctrace_emit(ggml_op_name(ctrace_node_t_->op), ctrace_node_t_->name, node_layer(ctrace_node_t_->name),
+                    ctrace_node_start_ns_, now, faults - ctrace_node_faults_);
+        ctrace_have_node_ = false;
+        ctrace_node_t_ = nullptr;
+    }
+    if (ctrace_layers_) ctrace_close_segment(-1, "post");
+    const uint64_t now = decode_trace_now_ns();
+    const uint64_t faults = pio::major_faults();
+    if (ctrace_decode_row_ < compute_rows_.size()) {
+        ComputeTraceRow & d = compute_rows_[ctrace_decode_row_];
+        if (d.op == "BMOE_DECODE") {
+            d.end_ns = now;
+            d.wall_ns = now >= d.start_ns ? now - d.start_ns : 0;
+            d.majflt = faults - ctrace_decode_faults_;
+        }
+    }
+    ctrace_decode_row_ = (size_t) -1;
 }
 
 bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
-    // ── compute trace: close the previous node's interval, open the next ──
-    // Ordering matters: this runs before every other job below, so the timestamp is as close to the
-    // boundary as possible and the streamer's own work (load_layer, the residency query) lands
-    // inside the routing node's interval where it belongs — that IS what routing costs here.
-    if (ctrace_on_ && !ask) {
-        if (ctrace_layers_) {
-            // Only isolated nodes reach this branch: layer boundaries, plus the routing nodes the
-            // streamer isolates anyway (a barrier that exists untraced too, so it is free to use).
-            // The interval since the previous boundary belongs to the segment we are LEAVING —
-            // attributing it to this node's layer would misfile nearly a whole layer, since a
-            // boundary node is the first node of the next one.
-            ctrace_close_segment(ctrace_obs_layer_, nullptr);
-            const int nl = node_layer(t->name);
-            if (nl >= 0) ctrace_obs_layer_ = nl; // layerless nodes (reshapes, views) don't move the cursor
-        } else {
-            const auto now = std::chrono::steady_clock::now();
-            const uint64_t faults = pio::major_faults();
-            ComputeTraceRow r;
-            r.turn = ctrace_turn_;
-            r.phase = ctrace_phase_;
-            r.step = ctrace_step_;
-            r.seq = ctrace_seq_++;
-            r.layer = node_layer(t->name);
-            r.op = ggml_op_name(t->op);
-            r.name = t->name;
-            r.wall_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(now - ctrace_mark_).count();
-            r.majflt = faults - ctrace_faults_;
-            compute_rows_.push_back(std::move(r));
-            ctrace_mark_ = now;
-            ctrace_faults_ = faults;
-        }
+    // ── compute trace (layer mode): close the previous segment at the observe boundary ──
+    // Per-node mode is bracketed in c_eval so this must not emit node rows. Layer mode keeps
+    // the broader interval-between-boundaries semantics (callback work included).
+    if (ctrace_on_ && ctrace_layers_ && !ask) {
+        // Only isolated nodes reach this branch: layer boundaries, plus the routing nodes the
+        // streamer isolates anyway (a barrier that exists untraced too, so it is free to use).
+        // The interval since the previous boundary belongs to the segment we are LEAVING —
+        // attributing it to this node's layer would misfile nearly a whole layer, since a
+        // boundary node is the first node of the next one.
+        ctrace_close_segment(ctrace_obs_layer_, nullptr);
+        const int nl = node_layer(t->name);
+        if (nl >= 0) ctrace_obs_layer_ = nl; // layerless nodes (reshapes, views) don't move the cursor
     }
 
     // ── capture: harvest expert weight tensors from every node's sources ──

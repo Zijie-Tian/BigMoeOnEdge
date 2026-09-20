@@ -7,6 +7,17 @@ Semantic Versioning.
 ## [0.24.0] - 2026-09-07
 
 ### Added
+- **DeepSeek-V2-Lite expert streaming.** Added the `deepseek2` architecture recipe for its
+  standard split expert tensors. The leading dense FFN, shared experts and MLA attention
+  remain under the existing dense-weight policy. A real-model Q4_K_M CPU run produced
+  byte-identical output in resident and streamed modes; no llama.cpp source patch is needed.
+- **Measured load/compute timelines from decode trace v2.** Compute and I/O traces now share
+  monotonic start/end timestamps and a session identifier. Graph-node intervals exclude the
+  surrounding callback work; decode frames, cache/load callbacks, reader lanes and per-worker
+  expert-readiness waits can be aligned without guessing chronology from durations.
+  `scripts/decode-analyze.py timeline` writes an SVG Gantt and JSON interval-union statistics,
+  distinguishing overlapping reads and any-worker waits from pure CPU time. Existing summary
+  commands still read v1 evidence. No llama.cpp source patch is required.
 - **`--release-mmap`: hand back the model file's mapping after load, which on Windows is worth
   +46% decode.** llama.cpp maps every gguf it loads and keeps the mapping for the model's
   lifetime. That is load-bearing for the streamer, which rebinds expert tensors onto the file's

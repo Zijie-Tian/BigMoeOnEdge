@@ -127,9 +127,10 @@ public:
     size_t worst_cycle_bytes(int top_k) const;
 
     // ── I/O trace (diagnostics; see bmoe/decode_trace.h) ────────────────────────────
-    // When on, every read_slice records one row. Rows are appended under a dedicated leaf mutex
-    // (reads happen on N lanes at once), so this costs a lock per read and is off by default.
-    // take_io_trace_rows moves the buffer out; the caller stamps the frame it belongs to.
+    // When on, every FileReader::read records a kind=read row, and every compute-thread unmet
+    // ready wait (spin included) records a kind=wait row. Rows are appended under a dedicated
+    // leaf mutex (never held across a read or wait). Off by default. take_io_trace_rows moves
+    // the buffer out; the caller stamps the frame it belongs to. Cache hits emit nothing.
     void set_io_trace(bool on);
     void take_io_trace_rows(std::vector<IoTraceRow> & out);
 
@@ -163,6 +164,7 @@ private:
 
     // `j` carries the read AND (for the trace) what it serves; `lane` is who is doing it.
     bool read_slice(int lane, const IoJob & j);
+    void emit_io_trace(const IoTraceRow & r); // io_trace_mtx_ only; never across read/wait
     void io_drain(int lane, uint64_t my_gen);
     void io_worker(int lane);
 
@@ -213,8 +215,9 @@ private:
     size_t entry_bytes(int il) const;
     void evict_tail();
 
-    // I/O trace buffer. Its own leaf mutex, never held across a read: the lanes append
-    // concurrently, and the eval thread swaps the buffer out between decodes.
+    // I/O trace buffer. Its own leaf mutex, never held across a read or wait: the lanes append
+    // concurrently, compute threads append waits, and the eval thread swaps the buffer out
+    // between decodes.
     bool io_trace_on_ = false;
     std::mutex io_trace_mtx_;
     std::vector<IoTraceRow> io_trace_rows_;

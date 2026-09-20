@@ -41,6 +41,9 @@ static const MoeRecipe k_recipes[] = {
     // node the hook reads (ffn_moe_topk). Both lower the streamed fraction relative to a purely
     // routed model — see docs/limitations.md.
     {"lfm2moe", {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}},
+    // deepseek2 (DeepSeek-V2-Lite): routed experts use the standard split layout. The
+    // leading dense FFN, shared experts and MLA attention remain on the dense-weight policy.
+    {"deepseek2", {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}},
     // deepseek4 (DeepSeek V4 Flash, 284B-A13B) reuses the V3.2 MoE routing — 256 routed experts,
     // top-k with a per-expert bias (exp_probs_b, the lfm2moe pattern) plus one always-on shared
     // expert (ffn_*_shexp) that matches no suffix and stays mmap-resident. The experts name the

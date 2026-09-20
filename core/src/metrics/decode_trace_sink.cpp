@@ -9,10 +9,11 @@ namespace {
 // The static preamble both traces share: the facts a row cannot carry, so a trace file stays
 // analysable without the run that produced it (same spirit as the metrics CSV's `# summary`).
 void write_static(std::FILE * f, const char * kind, const DecodeTraceStatic & s) {
-    std::fprintf(f, "# %s v1\n", kind);
+    std::fprintf(f, "# %s v2\n", kind);
     std::fprintf(f, "# model=%s arch=%s n_layer=%d n_threads=%d io_threads=%d o_direct=%d overlap=%d\n",
                  s.model.c_str(), s.arch.c_str(), s.n_layer, s.n_threads, s.io_threads, (int) s.o_direct,
                  (int) s.overlap);
+    std::fprintf(f, "# clock=steady_ns trace_id=%llu\n", (unsigned long long) s.trace_id);
 }
 
 // A node name can carry anything ggml put there; commas and quotes would break the column count.
@@ -38,7 +39,7 @@ public:
 
     void on_static(const DecodeTraceStatic & s) override {
         write_static(f_, "compute_trace", s);
-        std::fprintf(f_, "turn,phase,step,seq,layer,op,name,wall_ns,majflt\n");
+        std::fprintf(f_, "turn,phase,step,seq,layer,op,name,wall_ns,majflt,start_ns,end_ns\n");
         std::fflush(f_);
     }
 
@@ -49,7 +50,8 @@ public:
             write_csv_field(f_, r.op);
             std::fputc(',', f_);
             write_csv_field(f_, r.name);
-            std::fprintf(f_, ",%llu,%llu\n", (unsigned long long) r.wall_ns, (unsigned long long) r.majflt);
+            std::fprintf(f_, ",%llu,%llu,%llu,%llu\n", (unsigned long long) r.wall_ns, (unsigned long long) r.majflt,
+                         (unsigned long long) r.start_ns, (unsigned long long) r.end_ns);
         }
         std::fflush(f_); // once per decode, not per row
     }
@@ -67,17 +69,20 @@ public:
 
     void on_static(const DecodeTraceStatic & s) override {
         write_static(f_, "io_trace", s);
-        std::fprintf(f_, "turn,phase,step,layer,expert,proj,lane,spec,offset,req_bytes,read_bytes,latency_ns\n");
+        std::fprintf(f_, "turn,phase,step,layer,expert,proj,lane,spec,offset,req_bytes,read_bytes,latency_ns,start_ns,"
+                         "end_ns,kind,thread_id\n");
         std::fflush(f_);
     }
 
     void on_rows(const IoTraceRow * rows, size_t n) override {
         for (size_t i = 0; i < n; ++i) {
             const IoTraceRow & r = rows[i];
-            std::fprintf(f_, "%d,%d,%d,%d,%d,%d,%d,%u,%llu,%llu,%llu,%llu\n", r.turn, r.phase, r.step, r.layer,
-                         (int) r.expert, (int) r.proj, (int) r.lane, (unsigned) r.spec, (unsigned long long) r.offset,
-                         (unsigned long long) r.req_bytes, (unsigned long long) r.read_bytes,
-                         (unsigned long long) r.latency_ns);
+            std::fprintf(f_, "%d,%d,%d,%d,%d,%d,%d,%u,%llu,%llu,%llu,%llu,%llu,%llu,%s,%llu\n", r.turn, r.phase, r.step,
+                         r.layer, (int) r.expert, (int) r.proj, (int) r.lane, (unsigned) r.spec,
+                         (unsigned long long) r.offset, (unsigned long long) r.req_bytes,
+                         (unsigned long long) r.read_bytes, (unsigned long long) r.latency_ns,
+                         (unsigned long long) r.start_ns, (unsigned long long) r.end_ns, r.kind ? r.kind : "read",
+                         (unsigned long long) r.thread_id);
         }
         std::fflush(f_);
     }

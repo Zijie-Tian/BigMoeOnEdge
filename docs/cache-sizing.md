@@ -119,6 +119,20 @@ see the ordering warning below.
 > net loss (see [pressure.md](pressure.md)); `auto` now sizes **once at load** and stays fixed, so
 > bound it with `--cache-ceil-mb` on a model whose expert set dwarfs the device, or use cache-off.
 
+> **Linux cgroup limits are not an input to `auto`.** The current Linux implementation reads
+> host `/proc/meminfo`, not the process's cgroup `memory.max` or `memory.current`. A process
+> capped by systemd or a container can therefore receive a cache budget larger than its actual
+> memory allowance. The cgroup limit still applies to its allocations: with swap disabled,
+> an anonymous-memory working set larger than that allowance can cause an OOM kill rather than an
+> automatic reduction of the expert LRU. Use an explicit budget or ceiling with room for dense
+> weights, KV and compute buffers when deliberately streaming under such a cap.
+>
+> For a hot-state experiment, discard a warm-up generation and reuse the same process while
+> clearing only KV. Repeating a request can need no expert reads even when the *complete model*
+> exceeds the cgroup limit, because only that request's expert working set became resident.
+> Clean pages from the initial GGUF mapping can be reclaimed separately. If a cap kills the
+> process before warm-up completes, report that case as OOM, not as a zero-I/O hot result.
+
 ## Flags
 
 | Flag | Meaning |

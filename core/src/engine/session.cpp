@@ -1032,6 +1032,8 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         st.io_threads = cfg.moe.enabled ? cfg.moe.io_threads : 0;
         st.o_direct = cfg.moe.enabled && im.source.stats().o_direct; // the open's outcome, not the request
         st.overlap = cfg.moe.enabled && cfg.moe.overlap;
+        st.trace_id = decode_trace_now_ns();
+        if (st.trace_id == 0) st.trace_id = 1;
         if (compute_trace) {
             im.compute_trace = compute_trace;
             im.hook->set_compute_trace(true, cfg.compute_trace_layers);

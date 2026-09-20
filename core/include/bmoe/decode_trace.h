@@ -7,15 +7,16 @@
 // silently pooled into it. A residual cannot tell you which of those it is.
 //
 //   Compute trace — the eval callback, asked to isolate nodes, yields real per-node wall time:
-//   ggml computes exactly up to an isolated node, synchronizes, then calls back, so the delta
-//   between consecutive boundaries is that node's compute. Sampling major faults across the same
-//   boundaries attributes the >RAM residency stall to the node that paid it, which is the whole
-//   point: on a >RAM model most of "compute" is faults, and no residual can show that.
+//   ggml computes exactly up to an isolated node, synchronizes, then calls back. v2 timestamps
+//   (start_ns/end_ns) are std::chrono::steady_clock::time_since_epoch nanoseconds from this
+//   process. In per-node mode a node's span begins AFTER ask-side callback work and ends BEFORE
+//   observe-side callback work, so serial load/cache work is a BMOE_CALLBACK row, not the next
+//   kernel. Node wall includes backend scheduling, synchronization, and expert-read waits; it is
+//   not pure thread CPU time. BMOE_DECODE is the whole begin/end_compute_batch frame.
 //
-//   I/O trace — one row per flash read: latency, size, alignment waste and the (layer, expert,
-//   projection) it served. The aggregate read bandwidth is far below the drive's sequential
-//   ceiling because routed slices are scattered; this says by how much, and whether the cause is
-//   per-read latency, request size, or lanes idling.
+//   I/O trace — one row per FileReader::read (kind=read: copy/alignment included) and one row per
+//   compute-thread unmet-ready interval (kind=wait: spin included). Cache hits produce neither.
+//   Wait rows have lane=-1 and zero byte counts. latency_ns = end_ns - start_ns.
 //
 // Both are diagnostics, not telemetry, and both perturb what they measure — isolating nodes
 // forbids ggml the operator coalescing it would otherwise do, and the I/O rows take a lock on the
@@ -25,35 +26,48 @@
 //   (RunConfig::compute_trace_layers). ~n_layer barriers per token instead of ~3000 preserves
 //   operator coalescing and, crucially, the async expert prefetch: the io lanes keep streaming
 //   across a boundary, so the numbers stay close to an untraced run. Rows carry op "LAYER" and
-//   aggregate everything since the previous boundary: name "blk.<il>" is layer il's segment,
-//   "pre" is the embedding lookup before layer 0, and "post" (emitted when the batch closes) is
-//   the last layer's tail plus the final norm and LM head — per-op detail inside a segment is
-//   what this mode trades away.
+//   aggregate everything since the previous boundary (callback work included — broader than
+//   per-node): name "blk.<il>" is layer il's segment, "pre" is the embedding lookup before layer
+//   0, and "post" (emitted when the batch closes) is the last layer's tail plus the final norm
+//   and LM head — per-op detail inside a segment is what this mode trades away.
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace bmoe {
 
-// One isolated graph node's compute. Emitted only while the compute trace is on.
+// Monotonic nanoseconds of steady_clock::time_since_epoch in this process. Never wall clock.
+inline uint64_t decode_trace_now_ns() noexcept {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// One isolated graph node's compute, a LAYER segment, a BMOE_CALLBACK interval, or the
+// BMOE_DECODE frame. Emitted only while the compute trace is on.
 struct ComputeTraceRow {
     int turn = 0;  // session-mode turn (0 for a one-shot run)
     int phase = 0; // 0 = prefill, 1 = decode
     int step = 0;  // absolute context position of the token being computed
-    int seq = 0;   // node's position in the graph this decode (0-based), i.e. execution order
+    int seq = 0;   // trace-event order in this decode, including frame/callback rows
     int layer = -1;
-    // ggml's op name (ggml_op_name) and the node's own name. Deliberately raw: which node belongs
-    // to attention vs the dense FFN vs the expert matmul is naming policy that varies by
-    // architecture, so the engine reports what the graph said and the analysis script classifies.
+    // ggml's op name (ggml_op_name) and the node's own name, or BMOE_DECODE / BMOE_CALLBACK / LAYER.
+    // Deliberately raw: which node belongs to attention vs the dense FFN vs the expert matmul is
+    // naming policy that varies by architecture, so the engine reports what the graph said and
+    // the analysis script classifies.
     std::string op;
     std::string name;
-    uint64_t wall_ns = 0; // time to compute THIS node (delta between isolation boundaries)
-    uint64_t majflt = 0;  // major page faults charged to this node — flash re-reads inside compute
+    uint64_t wall_ns = 0;  // end_ns - start_ns (node wall is not pure thread CPU time)
+    uint64_t majflt = 0;   // major page faults charged to this interval
+    uint64_t start_ns = 0; // decode_trace_now_ns() at interval open
+    uint64_t end_ns = 0;   // decode_trace_now_ns() at interval close
 };
 
-// One flash read. Emitted only while the I/O trace is on.
+// One flash read (kind="read") or one compute-thread wait on an unmet ready flag (kind="wait").
+// Emitted only while the I/O trace is on.
 struct IoTraceRow {
     int turn = 0;
     int phase = 0;
@@ -61,12 +75,16 @@ struct IoTraceRow {
     int layer = -1;
     int32_t expert = -1;
     int8_t proj = -1;        // projection slot within the layer (recipe order)
-    int8_t lane = -1;        // which read lane served it
+    int8_t lane = -1;        // which read lane served it; -1 for kind=wait
     uint8_t spec = 0;        // 1 if issued speculatively by prefetch
     uint64_t offset = 0;     // absolute file offset requested
     uint64_t req_bytes = 0;  // bytes the caller wanted
     uint64_t read_bytes = 0; // bytes actually read (aligned window; ≥ req_bytes with O_DIRECT)
-    uint64_t latency_ns = 0; // wall time in the pread loop
+    uint64_t latency_ns = 0; // end_ns - start_ns
+    uint64_t start_ns = 0;
+    uint64_t end_ns = 0;
+    const char * kind = "read"; // "read" or "wait"; points at a string literal
+    uint64_t thread_id = 0;     // stable in-process numeric id (hash of std::thread::id)
 };
 
 // Run-level facts, emitted once before any row.
@@ -78,6 +96,7 @@ struct DecodeTraceStatic {
     int io_threads = 0;
     bool o_direct = false;
     bool overlap = false;
+    uint64_t trace_id = 0; // shared by both sinks of one Session::open; nonzero
 };
 
 // Optional sinks. The engine calls on_static once at open, then on_rows once per decode with that
