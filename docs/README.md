@@ -7,7 +7,7 @@ for the idea the project is built on.
 
 | Doc | What it answers |
 |---|---|
-| [architecture.md](architecture.md) | How the layers fit together, and why llama.cpp is not forked. |
+| [architecture.md](architecture.md) | How the layers fit together. Serial streaming uses llama.cpp's public API; optional `--overlap` is the small fork exception. |
 | [moe-streaming.md](moe-streaming.md) | Why streaming experts from flash makes a >RAM model run at all. |
 | [seam.md](seam.md) | The exact contract with llama.cpp's public API, and how to upgrade the submodule. |
 | [limitations.md](limitations.md) | What this does not do, what it cannot do, and the prior art it builds on. |
@@ -41,6 +41,7 @@ for the idea the project is built on.
 | [benchmark-method.md](benchmark-method.md) | How to measure this engine on any machine: what each knob does, when to move it, and the rules that keep a matrix honest. |
 | [community-benchmarks.md](community-benchmarks.md) | Results on hardware we do not own, the one-command protocol (`scripts/bench-report.sh`), and how to submit a row. |
 | [warmup-analysis.md](warmup-analysis.md) | Why first tokens are slow, and the two regimes behind it. |
+| [cpu-profiling-findings.md](cpu-profiling-findings.md) | Host CPU / cgroup-v2 retrospective: tiny-fixture identity, a misleading undersized-cache run, warm replay, synthetic caps, and DeepSeek-V2-Lite. Not a phone benchmark. |
 | [bench-data/](bench-data/) | Raw per-run CSVs and session notes. A dated archive — see its README. |
 
 Every benchmark figure in these docs is measured on the hardware named beside it. If you

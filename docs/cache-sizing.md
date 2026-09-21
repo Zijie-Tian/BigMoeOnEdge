@@ -62,6 +62,11 @@ budget sat under the cycle now says so, without needing a run of the same model 
   `available_RAM − cache_floor_mb`, clamped to `[cache_min_mb, total expert bytes]`. Available memory
   is read from the platform (`/proc/meminfo` `MemAvailable` on Linux/Android, `GlobalMemoryStatusEx`
   on Windows); if it is unknown the budget falls back to the `cache_min_mb` floor.
+  Under `--dense-weights anon` or `--dense-weights ahwb` (the internal `Pinned` policy),
+  `ExpertStreamSource::init` subtracts pending dense allocations and any row-gather window
+  first, skipping tensors that will stay mmap'd because they exceed available RAM.
+  `--dense-weights mmap` / `warm` do not convert those bytes, so they are not deducted.
+  The Linux reading is host `MemAvailable`; it does not honour cgroup `memory.max`.
 - **Also at init**, the dense (non-expert) regions of the gguf — header, embeddings, attention,
   norms, lm_head, the tensors the streamer leaves mmap-resident — are warmed into the page cache with
   one sequential buffered sweep (reported as `bmoe: dense warm-up`), so the first tokens do not pay
@@ -89,11 +94,16 @@ budget sat under the cycle now says so, without needing a run of the same model 
   moe-cache: 77.1% hit, resident 4000.0 MiB
   ```
 
-Because expert reads use O_DIRECT they never enter the page cache, shrinking this budget is what
-actually hands expert RAM back to the rest of the system. It is not the engine's only large
-allocation, though: under `--dense-weights anon` (the default) the whole dense set also lives in
-anon buffers. That footprint is **not** part of the cache budget and is not subtracted from it —
-see the ordering warning below.
+Expert miss reads request cache-bypassing I/O (`O_DIRECT` on Linux when the open and the
+verify succeed). Shrinking the expert cache is what hands those committed expert pages back.
+That is not the engine's only large allocation, and it is not a claim that load never
+touches the page cache: `Session::open` still mmaps the gguf (`LLAMA_LOAD_MODE_MMAP`), and
+`FileReader` can fall back to buffered I/O or a buffered EOF tail. Under `--dense-weights anon`
+or `ahwb` (the internal `Pinned` policy; anon is the default), the dense set is converted into engine buffers; that
+footprint is not part of the expert LRU, but `ExpertStreamSource::init` *does* deduct those
+pending allocations from the `MemAvailable` reading before `--cache-mb auto` chooses a
+budget. `--dense-weights mmap` / `warm` leave dense weights file-backed, so that deduction
+does not apply — `MemAvailable` still counts those mmap pages as free. See below.
 
 > **The budget is not only a throughput knob — it is what the kernel judges you by.** On Android the
 > LRU promotes a page to the protected list only on a *second* reference, and a cache hit is that
@@ -104,20 +114,24 @@ see the ordering warning below.
 > cache holding this model's own dense weights as free. Before trusting `auto` on a model whose
 > expert set dwarfs the budget, read [android-memory.md](android-memory.md).
 
-> **`auto` sizes before the dense weights are allocated.** The budget is chosen in
-> `ExpertStreamSource::init` as soon as the expert-set size is known
-> (`core/src/moe/expert_stream_source.cpp:68`); the dense policy runs later in the same init
-> (`:200`), and under the default `anon` mode it then allocates the entire dense set into anon
-> buffers. So the `MemAvailable` reading `auto` sizes from still counts that RAM as free. On a model
-> with a large dense set the over-ask is roughly the dense size — `--cache-ceil-mb` is the lever that
-> bounds it, which is why the Android example ships a 3000 MiB ceiling by default.
+> **`auto` deducts pending anon/pinned dense allocations, then sizes once.** The budget is
+> chosen in `ExpertStreamSource::init` after the expert-set size is known and *before*
+> `DenseWeights::init` allocates. For `Anonymous` and `Pinned`, the same tensors that
+> conversion will actually take (skipping oversized tensors that stay mmap'd, and charging
+> row-gathered tables only their window) are subtracted from `pio::mem_available_bytes()`
+> first, so the cache is not planned as if that RAM were still free. `mmap` and `warm` do
+> not convert, so they are not deducted — those pages remain file-backed. `--cache-ceil-mb`
+> remains the extra cap; the Android example still ships a 3000 MiB ceiling by default.
+> `auto` still does not read cgroup `memory.max`.
 
-> **`auto` sizes from a signal that lies, so keep it modest.** `auto` reads `MemAvailable`, which
-> reports memory the device will not actually concede (it counts the model's own mmap'd weights as
-> free), so it over-asks — and an over-ask is not a wasted budget but a running fight. The runtime
-> governor that once tried to correct this from the other end (`--cache-dynamic`) was retired as a
-> net loss (see [pressure.md](pressure.md)); `auto` now sizes **once at load** and stays fixed, so
-> bound it with `--cache-ceil-mb` on a model whose expert set dwarfs the device, or use cache-off.
+> **`auto` sizes from a signal that lies, so keep it modest.** After the anon/pinned
+> deduction above, `auto` still reads host `MemAvailable`, which reports memory the
+> device will not actually concede (remaining mmap'd weights still count as free, and
+> the figure is not a cgroup limit), so it can over-ask — and an over-ask is not a wasted
+> budget but a running fight. The runtime governor that once tried to correct this from
+> the other end (`--cache-dynamic`) was retired as a net loss (see [pressure.md](pressure.md));
+> `auto` now sizes **once at load** and stays fixed, so bound it with `--cache-ceil-mb` on a
+> model whose expert set dwarfs the device, or use cache-off.
 
 > **Linux cgroup limits are not an input to `auto`.** The current Linux implementation reads
 > host `/proc/meminfo`, not the process's cgroup `memory.max` or `memory.current`. A process
@@ -130,8 +144,11 @@ see the ordering warning below.
 > For a hot-state experiment, discard a warm-up generation and reuse the same process while
 > clearing only KV. Repeating a request can need no expert reads even when the *complete model*
 > exceeds the cgroup limit, because only that request's expert working set became resident.
-> Clean pages from the initial GGUF mapping can be reclaimed separately. If a cap kills the
-> process before warm-up completes, report that case as OOM, not as a zero-I/O hot result.
+> That zero is cache replay of retained experts, not evidence of small adjacent-token expert
+> changes or of zero I/O for long or new text. CPU contention can stretch timings; it cannot
+> erase read events that did happen. Clean pages from the initial GGUF mapping can be reclaimed
+> separately. If a cap kills the process before warm-up completes, report that case as OOM, not
+> as a zero-I/O hot result.
 
 ## Flags
 
@@ -140,7 +157,7 @@ see the ordering warning below.
 | `--cache-mb auto` | size the cache to the device instead of a fixed MiB (mutually exclusive with a numeric `--cache-mb`). **The CLI's default whenever `--moe-stream` is on**: pass a number, or `0` for no cache, to override it. The library's own default is still no cache, so an embedder passing 0 keeps meaning it |
 | `--cache-floor-mb N` | RAM to leave free for the rest of the system when auto-sizing (default 1536) |
 | `--cache-ceil-mb N` | upper bound on the auto-sized budget (0 = no cap). Use it — uncapped `auto` over-asks |
-| `--dense-weights mmap\|warm\|anon` | the dense (non-expert) weight policy. `warm` is the load-time page-cache sweep described above; `mmap` skips it; `anon` (default) reads the dense set via O_DIRECT into anonymous buffers instead, which is the right answer well past RAM — see [benchmarks-gpt-oss.md](benchmarks-gpt-oss.md). `--no-warm-dense` and `--dense-odirect` are deprecated aliases for `mmap` and `anon` |
+| `--dense-weights mmap\|warm\|anon\|ahwb` | the dense (non-expert) weight policy. `warm` is the load-time page-cache sweep; `mmap` leaves file-backed weights alone; `anon` (default) reads them into anonymous buffers; `ahwb` uses Android-only reclaim-exempt memory. See [benchmarks-gpt-oss.md](benchmarks-gpt-oss.md). `--no-warm-dense` and `--dense-odirect` are legacy aliases for `mmap` and `anon` |
 
 `auto` is a real LRU cache, so it satisfies the cache requirement of `--prefetch`.
 

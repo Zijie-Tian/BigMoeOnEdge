@@ -62,14 +62,15 @@ already public in llama.cpp:
 3. **The file layout.** `gguf_get_tensor_offset` (public) gives each tensor's byte offset
    so we can `pread` individual expert slices.
 
-Loading with `use_mmap=true, use_extra_bufts=false` keeps the weights in their native
-gguf layout (a repacked buffer would break the rebind). That is a public model
-parameter.
+Loading with `load_mode = LLAMA_LOAD_MODE_MMAP` and `use_extra_bufts = false` keeps the weights in their native
+gguf layout (a repacked buffer would break the rebind). `Session::open` also sets `n_gpu_layers = 0` for
+the whole model — dense and expert, not merely streamed experts — so the current engine is CPU-only.
+Those are public model parameters (`core/src/engine/session.cpp`).
 
-Because none of this touches llama.cpp internals, the serial streaming path runs against
-the unmodified upstream repository. Contrast with approaches that patch the model files:
-those must be rebased on every release. Here, `git submodule update --remote` and a rebuild
-is the whole upgrade.
+The serial streaming seam can run against stock upstream without an in-tree patch. Upgrades
+remain submodule-pointer changes, but still require checking graph naming/scheduling, the
+optional ready hook and the non-stable `common` integration. Follow [seam.md](seam.md) and run
+the build and gates; `git submodule update --remote` alone is not an upgrade-validation procedure.
 
 The one place we do carry an extension is the optional `--overlap` feature. Overlapping a
 token's expert reads with its expert matmuls needs a per-expert wait point *inside* the CPU
@@ -86,12 +87,13 @@ on.
 
 The composition root is `Session` (core/src/engine/session.cpp):
 
-1. `open()` — load model (mmap on, repack off, experts on CPU); if streaming, resolve the
-   architecture recipe, install the router hook, do the capture warm-up, bind the expert
-   source, clear the warm-up KV. Done **once** per model.
-2. `generate()` — prefill the prompt, then greedily decode `n_predict` tokens, reporting
-   per-token metrics. Callable repeatedly; the expert cache stays warm between calls (see
-   [session.md](session.md)). Cancellable mid-flight via the abort callback.
+1. `open()` — load the model (`load_mode = LLAMA_LOAD_MODE_MMAP`, `use_extra_bufts = false`,
+   `n_gpu_layers = 0`); if streaming, resolve the architecture recipe, install the router hook,
+   do the capture warm-up, bind the expert source, clear the warm-up KV. Done **once** per model.
+2. `generate()` — prefill the prompt in `n_batch` chunks (`run()` sets `n_batch = n_ctx`), then
+   decode `n_predict` tokens (greedy by default; `--mtp` / `--ngram` may widen a verify batch),
+   reporting per-token metrics. Callable repeatedly; the expert cache stays warm between calls
+   (see [session.md](session.md)). Cancellable mid-flight via the abort callback.
 3. Destructor — tear down in order: I/O pool, context, hook, model, backend.
 
 `run()` (core/src/engine/runtime.cpp) is a thin one-shot wrapper — open, one generate, close —

@@ -460,8 +460,10 @@ every layer's experts except the last one's.
 A `step` below zero would mean a row that could not be attributed to a position (more than one
 output token in a batch). The CLI's greedy loops never produce one.
 
-Join it to `--csv` on `step` (subtracting the prompt length from the trace's `step` for the
-decode phase) to put per-token wall time next to what was routed.
+Join on the session `turn` as well as position. For ordinary one-token decode with KV cleared,
+the first decode trace position is `n_prompt`, while the per-token CSV starts at `step=1`:
+`csv_step = trace_step - n_prompt + 1`. Prefill, speculative batches and reused KV require
+their actual absolute positions/batch metadata rather than a blind prompt-length subtraction.
 
 `scripts/route-analyze.py` reads the file — stdlib only, nothing to install:
 

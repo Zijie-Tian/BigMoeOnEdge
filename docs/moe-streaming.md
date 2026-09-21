@@ -7,46 +7,59 @@ only its top-`k` (8). The other experts' weights are never read for that token. 
 model does not fit in RAM, streaming just the routed experts from flash turns "the whole
 expert bank per token" into "top-k/n_expert of it" — about 6% for that model.
 
-This sparsity is real **only for autoregressive, one-token-at-a-time decoding**. A batch
-of `T` tokens routes the *union* of `T × k` experts, which approaches all of them for any
-useful `T`. So streaming deliberately runs at n=1 and is incompatible with speculative
-decoding or a canvas — the engine keeps decode single-token by construction.
+This sparsity is largest for **autoregressive, one-token-at-a-time decoding**. A batch of `T`
+tokens routes the *union* of those tokens' top-k sets, which grows toward the full bank as `T`
+grows — wider routing unions reduce sparsity. Prefill is already batched (`n_batch`; one-shot
+`run()` uses `n_batch = n_ctx`). Optional `--mtp` and `--ngram` speculative decode exist and
+verify a wider batch; streaming is compatible with both, but the expert I/O is that union, not
+a single token's top-k. Default greedy decode still submits one new token per graph unless
+speculation widens it.
 
 ## Mechanism
 
-1. **Bind.** After a one-token warm-up capture (see [seam.md](seam.md)), every layer's
-   three expert tensors (`ffn_{gate,up,down}_exps`) are rebound onto streaming buffers and
-   never read from the mmap again.
-2. **Route.** The eval-callback marks only the routing node `ffn_moe_topk-<il>` as needed.
-   ggml computes it alone, synchronizes, and calls back with the selected expert ids. They
-   are gathered **respecting the view strides** — `selected_experts` is a view of the full
+1. **Bind.** After capture warm-up (see [seam.md](seam.md)), each bound MoE layer's expert
+   tensors are rebound onto streaming buffers: split gate/up/down or a recipe's fused gate+up
+   layout. Dense layers are not bound as routed experts.
+2. **Route.** Normal demand loading observes `ffn_moe_topk-<il>`; optional diagnostics and
+   routing policies may request additional nodes. ggml computes and synchronizes the needed node.
+   The selected IDs are gathered **respecting the view strides** — `selected_experts` is a view of the full
    argsort with row stride `nb[1]`, so a flat read would grab the wrong experts and corrupt
    the KV cache.
-3. **Load.** The expert source reads exactly those experts' slices from the gguf
-   (`O_DIRECT`, page cache bypassed) into each expert's canonical offset inside the bound
-   tensor, just before that layer's expert matmul runs.
+3. **Load.** The expert source reads those experts' slices from the gguf into each expert's
+   canonical offset inside the bound tensor, just before that layer's expert matmul runs.
+   Linux misses request `O_DIRECT` (`FileReader` in `core/src/io/file_reader.cpp`), with a
+   buffered verify, a buffered fallback if the verify fails, and a buffered sub-alignment EOF
+   tail. `--no-odirect` only changes expert readers; dense anon/pinned uses its own
+   `FileReader`, independent of that flag. Direct expert I/O does not eliminate the initial
+   mmap or capture-warmup page cache (`LLAMA_LOAD_MODE_MMAP` in `Session::open`).
 
 Ordering is guaranteed by ggml's eval-callback loop: the node we mark is computed and
 `ggml_backend_synchronize`'d before the non-ask callback fires, and the following compute
 (the expert matmul) runs only after our load returns. The next layer cannot overwrite the
-buffers until this layer's matmul has synchronized. Correct on any backend.
+buffers until this layer's matmul has synchronized. This describes serial streaming on the
+current CPU path (`n_gpu_layers = 0`), not correctness on arbitrary ggml backends. With
+`--overlap`, load submission returns before all reads finish; the fork's expert-ready hook
+then gates each projection/expert before consumption, as described in [seam.md](seam.md).
 
-The result is **lossless**: byte-identical to running with every expert resident, asserted
-by the gates. That is the streaming path itself; two opt-in knobs deliberately trade output for
-speed on top of it — `--n-expert-used` (fewer experts per token) and
-[`--drop-cold-experts`](expert-dropping.md) (skip an expert that would cost a read and was barely
-weighted). Both are off unless asked for, which is what keeps the sentence above true by default.
+The ordinary streaming path is **lossless** with unchanged routing and sampling, asserted by
+the byte-identity gates. Expert-count overrides, [cold-expert dropping](expert-dropping.md),
+[cache-aware substitution](cache-aware-substitution.md) and [route-ahead](route-ahead.md) are
+separate, opt-in policies that deliberately change routing/output. Do not transfer the
+losslessness claim to those settings; they are off in the default greedy CLI configuration.
 
 ## Residency modes
 
-- **Cache off (shared slots).** Three heap buffers (full `n_expert` size) are shared
-  across layers — one layer computes at a time. Routed slices are re-read fresh every
-  token. Lowest RAM, highest I/O.
+- **Cache off (shared slots).** One full-size heap slot per present projection is shared
+  across layers — one layer computes at a time. Routed slices are reread each step. This avoids
+  cross-layer expert residency, at the cost of repeat I/O.
 - **LRU cache (`--cache-mb N`).** Each `(layer, projection)` gets a reserved,
-  lazily-committed address range. A routed expert already resident is a **hit** (no read);
+  lazily-committed address range. Cache *keys* are `(layer, expert)` (`id = il * n_expert + e`
+  in `ExpertStreamSource`). A routed expert already resident is a **hit** (no read);
   a miss is read once and kept; over budget, the coldest `(layer, expert)` is evicted and
-  its pages physically released (`madvise(MADV_DONTNEED)` / `MEM_DECOMMIT`). RAM is bounded
-  for real.
+  its pages physically released (`madvise(MADV_DONTNEED)` / `MEM_DECOMMIT`). The budget targets
+  expert residency, not total process memory; current/in-flight entries remain protected.
+  Overlap readiness is separate: one cell per `(projection, expert)`, valid when
+  `gen == async_gen_` for the in-flight layer (`ReadyFlag` in `core/src/moe/expert_stream_source.h`).
 
 ### The cache rule: 0 or ≥ ~2 GB
 

@@ -7,6 +7,12 @@ Semantic Versioning.
 ## [0.24.0] - 2026-09-07
 
 ### Added
+- **Repository knowledge and host-profiling documentation.** Expanded `AGENTS.md` with the
+  implementation boundary, build/conversion workflow, cache and cgroup behavior, trace
+  semantics, recorded experiment outcomes and unresolved research questions. Added a
+  self-contained CPU profiling retrospective, linked it from the documentation index,
+  and corrected stale CPU/offload, speculation and dense-budget descriptions. No new
+  benchmark runs or inference behavior changes are claimed by this documentation update.
 - **DeepSeek-V2-Lite expert streaming.** Added the `deepseek2` architecture recipe for its
   standard split expert tensors. The leading dense FFN, shared experts and MLA attention
   remain under the existing dense-weight policy. A real-model Q4_K_M CPU run produced

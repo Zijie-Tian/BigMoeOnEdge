@@ -18,21 +18,26 @@ serial path, and only a single ~25-line hook (with an explicit sunset) for the o
 
 ## Limitations
 
-- **Two settings make output non-reproducible.** Every other knob is deterministic given a
-  configuration: `--n-expert-used` changes the output, but changes it the same way on every run.
-  [`--drop-cold-experts`](expert-dropping.md) and
-  [`--expert-substitute`](cache-aware-substitution.md) decide per routing from live cache state,
-  so the same prompt and the same flags can decode differently run to run, and the byte-identity
-  gates cannot cover their output — only their machinery. Both off by default in the CLI, and
-  neither can be priced by a wide scoring batch: use `--ppl --ppl-step`.
-- **n=1 only.** The expert sparsity exists only for single-token decode, so streaming is
-  incompatible with speculative decoding or batching. Prefill streams the union of the
-  prompt's routed experts (still far below the full bank, but larger than one token's).
-- **CPU experts.** Streamed experts are computed on CPU; the rebind targets host memory.
-  GPU offload of the streamed experts is not supported (the dense parts can still use the
-  GPU). Decode is flash-I/O-bound anyway, so this is rarely the bottleneck.
+- **Reproducibility depends on routing and sampling.** `--n-expert-used` deliberately changes
+  routing width and output. [`--drop-cold-experts`](expert-dropping.md) and
+  [`--expert-substitute`](cache-aware-substitution.md) additionally decide from live cache state,
+  so even with greedy sampling the same prompt and flags can decode differently across runs.
+  The gates cover their machinery, not a promise of byte-identical output. Both are off by
+  default in the CLI; use `--ppl --ppl-step` rather than wide scoring batches to price them.
+  When stochastic sampling is enabled, also record temperature and seed rather than assuming
+  every non-cache setting preserves deterministic output.
+- **Sparsity shrinks with the routing union.** Single-token greedy decode is the sparse case
+  (top-k experts per layer). Prefill is batched (`n_batch`); `--mtp` and `--ngram` speculative
+  decode exist (`core/src/engine/session.cpp`, `core/src/engine/ngram_draft.cpp`) and verify a
+  wider batch. Streaming is not categorically incompatible with batching or speculation, but
+  the load is the union of the batch's routed experts — larger than one token's set, and able
+  to approach the full bank as the batch grows.
+- **CPU-only today.** `Session::open` sets `n_gpu_layers = 0` for every layer, not merely the
+  streamed experts; the rebind targets host memory. GPU offload is not a current path. Wall
+  time is not always flash-I/O-bound: CPU contention can dominate or distort timing
+  attribution even while expert read bytes and events remain real.
 - **Shared experts stay resident.** Architectures with an always-on shared expert (e.g.
-  `gemma4`, `deepseek4`) stream the routed experts but keep the shared expert — and any dense layers —
+  `gemma4`, `deepseek2`, `deepseek4`) stream routed experts but keep shared experts and dense layers
   resident (in the page cache, or in the engine's own buffers under `--dense-weights anon`),
   so the streamed fraction (and the memory saving) is smaller than for a purely routed model
   like `qwen3moe`. The same applies to architectures whose first blocks are dense by design
@@ -71,6 +76,21 @@ serial path, and only a single ~25-line hook (with an explicit sunset) for the o
   targets are stated for Android/Linux.
 - **Depends on a ggml scheduling behaviour** (documented in [seam.md](seam.md)) that is
   not a stability-guaranteed contract. Re-verified by the gates on each submodule bump.
+- **Compute-trace frames can leak across a failed or cancelled generate.** `RouterHook::begin_compute_batch`
+  (`core/src/moe/router_hook.cpp`) opens a `BMOE_DECODE` row with `end_ns = 0`. `Session::generate`
+  (`core/src/engine/session.cpp`) only runs `trace_flush` → `end_compute_batch` after a successful
+  `llama_decode`. Prefill and decode error/cancel exits can return or break without flushing, so
+  the open frame stays in `compute_rows_`. A later successful generation may flush that invalid
+  row with the new one; a timeline that requires a closed interval will reject it. Static reading
+  of those functions, not reproduced by a cancel regression. Normal, non-cancelled runs were
+  validated. This is not a claim that the code has been fixed.
+- **Zero expert I/O on a hot replay is cache, not routing stability.** Repeating an identical
+  short greedy request with `clear_kv = true` retains expert weights and replays routing; zero
+  expert reads is not evidence that adjacent tokens or long/new text would also need no I/O.
+  CPU contention can distort wall-time attribution but cannot turn actual read bytes/events
+  into zero. `taskset` is affinity, not CPU exclusivity. Per-node graph wall includes sync,
+  scheduling and waits (`core/include/bmoe/decode_trace.h`); `FileReader` intervals include
+  copies; summing those intervals is a union, not a per-lane or per-thread duration.
 
 ## Not goals
 
