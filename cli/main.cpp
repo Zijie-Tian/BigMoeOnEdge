@@ -107,10 +107,12 @@ static void emit_progress_line(const TokenMetrics & m, ProgressDelta & st) {
     std::printf("BMOE_PROGRESS {\"step\":%d,\"steps\":%d,\"wall_ms\":%.1f,\"io_ms\":%.1f,"
                 "\"compute_ms\":%.1f,\"mgmt_ms\":%.1f,\"stall_ms\":%.1f,\"read_mb\":%.2f,"
                 "\"cache_hit_pct\":%.1f,\"majflt\":%llu,\"cpu_ms\":%.1f,\"dense_resident_frac\":%.3f,"
+                "\"block_read_mb\":%.2f,"
                 "%s\"delta_reasoning\":\"%s\",\"delta_text\":\"%s\"}\n",
                 m.step, m.steps, m.wall_ms, m.io_ms, m.compute_ms, m.mgmt_ms, m.stall_ms,
                 m.read_bytes / (1024.0 * 1024.0), m.cache_hit_pct, (unsigned long long) m.majflt, m.cpu_ms,
-                m.dense_resident_frac, ext ? "" : "\"reset\":1,", json_escape(d_reason).c_str(),
+                m.dense_resident_frac, m.block_read_bytes / (1024.0 * 1024.0), ext ? "" : "\"reset\":1,",
+                json_escape(d_reason).c_str(),
                 json_escape(d_text).c_str());
     st.reasoning = m.reasoning;
     st.text = m.text;
@@ -247,9 +249,10 @@ static int run_session_loop(const RunConfig & cfg,
     // anything sensible about --drop-cold-experts, whose threshold is a fraction of 1/top-k: the
     // same percentage trims a tail at 8 and takes half the routing at 2. 0 on a non-MoE model.
     std::printf("BMOE_READY {\"load_s\":%.3f,\"arch\":\"%s\",\"n_ctx\":%d,\"think_ctl\":\"%s\","
-                "\"n_expert_used\":%d}\n",
+                "\"n_expert_used\":%d,\"load_block_read_mib\":%.2f}\n",
                 session->load_seconds(), json_escape(session->arch()).c_str(), session->n_ctx(),
-                bmoe::think_control_name(session->think_control()), session->n_expert_used());
+                bmoe::think_control_name(session->think_control()), session->n_expert_used(),
+                session->load_block_read_bytes() / (1024.0 * 1024.0));
     std::fflush(stdout);
 
     std::mutex mtx;
@@ -338,6 +341,7 @@ static int run_session_loop(const RunConfig & cfg,
                     "\"prefill_tps\":%.2f,\"load_s\":%.3f,\"cache_hit_pct\":%.1f,\"n_prompt\":%d,\"n_past\":%d,"
                     "\"compute_s_tok\":%.4f,\"io_s_tok\":%.4f,\"cache_resident_mib\":%.0f,\"cache_budget_mib\":%.0f,"
                     "\"read_mib\":%.1f,\"stall_s_tok\":%.4f,\"mgmt_s_tok\":%.4f,\"majflt_tok\":%.2f,\"cpu_s_tok\":%.4f,"
+                    "\"block_read_mib\":%.2f,\"block_read_mib_tok\":%.2f,\"prefill_block_read_mib\":%.2f,"
                     "\"prefill_cpu_s\":%.3f,\"prefill_read_mib\":%.1f,\"prefill_io_s\":%.3f,"
                     "\"prefill_stall_s\":%.3f,\"prefill_mgmt_s\":%.3f,"
                     "\"token_demand_mib\":%.1f,\"mtp_drafted\":%lld,\"mtp_accepted\":%lld,\"mtp_decodes\":%lld,"
@@ -347,7 +351,9 @@ static int run_session_loop(const RunConfig & cfg,
                     (s.prefill_seconds > 0 ? s.n_prompt / s.prefill_seconds : 0.0), s.load_seconds, s.cache_hit_pct,
                     s.n_prompt, s.n_past, s.moe_compute_s_per_token, s.moe_io_s_per_token, s.cache_resident_mib,
                     s.cache_budget_mib, s.moe_read_mib, s.moe_stall_s_per_token, s.moe_mgmt_s_per_token,
-                    s.majflt_per_token, s.cpu_s_per_token, s.prefill_cpu_seconds, s.prefill_read_mib,
+                    s.majflt_per_token, s.cpu_s_per_token, s.block_read_mib,
+                    s.n_generated ? s.block_read_mib / s.n_generated : 0.0, s.prefill_block_read_mib,
+                    s.prefill_cpu_seconds, s.prefill_read_mib,
                     s.prefill_io_seconds, s.prefill_stall_seconds, s.prefill_mgmt_seconds, s.token_demand_mib,
                     s.mtp_drafted, s.mtp_accepted, s.mtp_decodes, s.mtp_draft_s_per_token, s.drafted_steps,
                     s.loop_overhead_s_per_token, json_escape(r.reasoning_text).c_str(),

@@ -91,6 +91,11 @@ BMOE_PROGRESS {"step":<int>,"steps":<int>,"wall_ms":<float>,"io_ms":<float>,
   near 100% is genuinely compute-bound, well below means the cores were throttled, preempted, or
   blocked (a low-clock frequency cap or a co-resident process), not doing more math. Both are `0`
   when the platform can't report them (the Windows host build); treat `0` as "unmeasured".
+  `block_read_mb` is the `/proc/self/io` `read_bytes` delta across that same decode: bytes this
+  process submitted to the block layer, readahead included, page-cache hits excluded. It is the
+  mmap traffic `read_mb` cannot see (`read_mb` stays 0 without a FileReader). Zram swap-in is
+  included, so it is process block traffic, not a pure NVMe counter. `0` when `/proc/self/io`
+  cannot be read.
 - `dense_resident_frac` is the sampled fraction of the DENSE (non-expert) weights still in RAM (by
   `mincore`, throttled). Under `--dense-weights anon` it samples our own buffers (is zram holding
   them?); under mmap/warm the model's mmap (is the kernel dropping it?). A diagnostic read alongside
@@ -320,7 +325,7 @@ next to the `turn` column.
 step,steps,wall_ms,io_ms,compute_ms,read_bytes,cache_hit_pct,stall_ms,mgmt_ms,majflt,cpu_ms,
 dense_resident_frac,turn,majflt_mib,cache_budget_mib,rss_mib,rss_anon_mib,rss_file_mib,swap_mib,
 mem_available_mib,mem_free_mib,swap_free_mib,loop_overhead_ms,mtp_batch,mtp_draft_ms,drain_ms,
-adopt_ms,ra_issue_ms,ra_wd_ms
+adopt_ms,ra_issue_ms,ra_wd_ms,block_read_bytes
 ```
 
 `stall_ms`, `mgmt_ms`, `majflt`, `cpu_ms` and `dense_resident_frac` are trailing columns appended
@@ -364,7 +369,8 @@ The trailing block is the memory picture, added so a run can be diagnosed from i
 | column | meaning |
 | --- | --- |
 | `turn` | which `generate()` this token belongs to (0 for a one-shot run). A session CSV spans every turn; without this the two-turn shape — a fast turn, an idle, then the turn that pays for it — is unreadable. |
-| `majflt_mib` | what those faults moved: `majflt` x page size. The same fact as the count, in the unit the rest of the row uses — directly comparable to `read_bytes`, i.e. the reads we chose against the reads the kernel forced on us. |
+| `majflt_mib` | what those faults moved: `majflt` x page size. A lower bound on mmap traffic: one fault counts one page, and readahead bytes fetched beside it are not another fault. |
+| `block_read_bytes` | bytes this decode submitted to the block layer (`/proc/self/io` `read_bytes` delta). Readahead counts; a cache hit does not. Includes zram swap-in. Comparable to FileReader `read_bytes`, and the mmap figure `majflt_mib` under-counts. |
 | `cache_budget_mib` | the expert-cache budget in effect. Fixed for the run now (an explicit `--cache-mb`, or what `auto` sized to once at load) — the runtime governor that moved it is retired. |
 | `rss_anon_mib` | resident anonymous memory — **the expert cache lives here** (and, under `--dense-weights anon`, the dense buffers). Falling while `cache_budget_mib` stays put means the kernel is taking it. |
 | `rss_file_mib` | resident file-backed memory — the mmap'd model. Reclaimed by being dropped, not swapped, so it never shows in `swap_mib`. |
@@ -507,7 +513,8 @@ Responses (stdout):
 
 ```
 BMOE_READY {"load_s":<float>,"arch":"<string>","n_ctx":<int>,
-            "think_ctl":"template|prefill|none","n_expert_used":<int>}  # once, after the model loads
+            "think_ctl":"template|prefill|none","n_expert_used":<int>,
+            "load_block_read_mib":<float>}  # once, after the model loads
 BMOE_BEGIN {"id":<int>}                                                # a generation started
 BMOE_LOAD / BMOE_PROGRESS ...                                          # per token, as above
 BMOE_DONE  {"id":<int>,"cancelled":<bool>,"tokens":<int>,"tok_s":<float>,
@@ -515,6 +522,7 @@ BMOE_DONE  {"id":<int>,"cancelled":<bool>,"tokens":<int>,"tok_s":<float>,
             "n_prompt":<int>,"n_past":<int>,"compute_s_tok":<float>,"io_s_tok":<float>,
             "cache_resident_mib":<float>,"cache_budget_mib":<float>,"read_mib":<float>,
             "stall_s_tok":<float>,"mgmt_s_tok":<float>,"majflt_tok":<float>,"cpu_s_tok":<float>,
+            "block_read_mib":<float>,"block_read_mib_tok":<float>,"prefill_block_read_mib":<float>,
             "prefill_cpu_s":<float>,"prefill_read_mib":<float>,"prefill_io_s":<float>,
             "prefill_stall_s":<float>,"prefill_mgmt_s":<float>,
             "token_demand_mib":<float>,"mtp_drafted":<int>,"mtp_accepted":<int>,"mtp_decodes":<int>,
@@ -531,6 +539,11 @@ excludes both, so `1 / (1/tok_s + loop_overhead_s_tok)` is the rate a user actua
 `drafted_steps` is how many passes drafted at all: it equals `mtp_decodes` for the head and is lower
 for `--ngram`, which decodes plainly when it has no match. See [mtp.md](mtp.md) and
 [ngram.md](ngram.md).
+
+`load_block_read_mib` is the block-layer bytes fetched during `open()` (mapping and capture).
+`block_read_mib` / `block_read_mib_tok` are the same counter summed over this turn's generation
+decodes, and `prefill_block_read_mib` over its prefill. They are `/proc/self/io` `read_bytes`
+deltas, not FileReader bytes: mmap traffic shows up here while `read_mib` stays 0.
 
 The `prefill_*` keys are the prompt phase's own attribution (#173): `prefill_read_mib` / `_io_s` /
 `_stall_s` / `_mgmt_s` are deltas of the same cumulative streamer counters the decode fields come

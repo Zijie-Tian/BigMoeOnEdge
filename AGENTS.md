@@ -7,6 +7,7 @@ It follows the [AGENTS.md](https://agents.md) convention, so any coding agent pi
 Quick navigation: [hard rules](#hard-rules), [build](#build-and-test),
 [execution/cache](#execution-and-cache-model), [page cache](#page-cache-exact-scope-of-bypass),
 [cgroups](#memory-budgets-and-cgroups), [profiling](#traces-and-measurement-semantics),
+[mmap bytes](#mmap-block-layer-traffic),
 [measured findings](#what-the-investigation-established), [open questions](#interpretation-limits-and-deferred-work).
 
 ## What this is
@@ -358,7 +359,7 @@ overrides to that generator; there is no invented `--scale` CLI flag.
 
 | Instrument | What it establishes |
 |---|---|
-| `--csv` / `BMOE_*` | Per-token/run telemetry. `compute_ms` is a residual, not an independent kernel CPU clock. |
+| `--csv` / `BMOE_*` | Per-token/run telemetry. `compute_ms` is a residual, not an independent kernel CPU clock. `block_read_*` is mmap-visible block traffic; `read_bytes` is FileReader only. |
 | `--route-trace` | Selected expert IDs, weights, cache residency and attributed bytes, keyed by turn/phase/step/layer/slot. |
 | `--compute-trace` | v2 monotonic graph-node, callback and enclosing decode-frame intervals; expensive per-node isolation. |
 | `--compute-trace-layers` | Coarser segments with fewer barriers; includes callback/load work, not isolated kernels. |
@@ -388,6 +389,8 @@ Do not conflate these quantities:
   It does not imply zero system-wide disk traffic: logging, mappings and other processes differ.
 - `o_direct=1`, cache-hit percentage and time residuals alone do not prove every access is uncached
   or establish a compute/storage bottleneck. Tracing itself changes scheduling.
+- `majflt_mib` is `majflt × page size`. One fault counts one page; readahead bytes fetched beside
+  it are not another fault. Quote `block_read_*` for mmap SSD traffic.
 
 ```bash
 python3 scripts/decode-analyze.py timeline compute.csv --io io.csv \
@@ -405,6 +408,72 @@ runtime's `--overlap` scheduling feature. For ordinary one-token decode, CSV pro
 corresponds to trace position `n_prompt`; account for the one-based offset and the session turn
 when joining them. Speculative batches and reused KV need their actual positions, not a
 blind prompt-length subtraction.
+
+## Mmap block-layer traffic
+
+Ordinary mmap has no `FileReader`, so CSV `read_bytes` / `read_mib` stay 0. The byte counter is
+`platform_io::block_read_bytes()`: `/proc/self/io` field `read_bytes`, accounted at `submit_bio`
+for the whole thread group. Sample it outside the decode wall bracket, the same way as `majflt`.
+
+| Field | Window | Unit |
+|---|---|---|
+| `BMOE_READY` `load_block_read_mib` | `Session::open` (map and capture) | total MiB |
+| `BMOE_DONE` `prefill_block_read_mib` | that turn's prompt prefill | total MiB for the prompt, not per token |
+| `BMOE_DONE` `block_read_mib` / `block_read_mib_tok` | generation `llama_decode`s | total, and mean per generated token |
+| `BMOE_PROGRESS` `block_read_mb`, CSV `block_read_bytes` | one generation decode | that token |
+
+Readahead counts. A page-cache hit counts as zero. Zram swap-in counts, because it is a bio.
+Cross-check the same window with `/sys/block/nvme0n1/stat` read sectors × 512, and the sum of
+`/sys/block/zram*/stat` read sectors. Process `read_bytes` minus NVMe is the non-NVMe remainder
+on a quiet board. `rchar` is `read()` bytes and stays near zero for mmap. `rss_file` is residency
+at a sample, not bytes transferred: a reclaimed page can be read again while RSS stays flat.
+
+`clear_kv=true` drops KV only. The next `generate` still prefills the prompt. File pages survive
+that drop, so a hot turn's prefill is zero only when those pages are still resident.
+
+Repeat the 2026-09-22 measurement as follows. Full tables:
+[Jetson AGX mmap record](docs/experiment/2026-09-21-jetson-agx-mmap-q4-0.md). The board build
+(CPU only, `GGML_NATIVE=OFF`, `-march=armv8.2-a+fp16`) is in that file. A non-interactive shell
+may not see the cmake that configured an existing tree; use the cache's `CMAKE_COMMAND`.
+
+- Three boards, same SoC class, visible RAM about 30 / 7.6 / 3.6 GiB. The smaller two are kernel
+  `mem=` caps, not cgroup `memory.max`. Phrase them as Host A / B / C. Do not publish hostnames,
+  addresses, or local paths.
+- Model: DeepSeek-V2-Lite pure `Q4_0` (file 8,851,045,376 bytes). Prompt `The capital of Japan is`
+  (6 tokens). Greedy. `-t 4 -c 256`. `--ubatch 128` on A/B, `64` on C. No `--moe-stream`. Leave
+  `--compute-trace` off: the traced time-split table is a different run, and its tok/s are not
+  comparable to this one.
+- `POSIX_FADV_DONTNEED` on that model file only, before the process. Never drop the global page
+  cache.
+- One process, two `generate` requests, `clear_kv=true`. Turn 0 is cold. Turn 1 is hot.
+
+```bash
+printf '%s\n' \
+  '{"cmd":"generate","id":1,"prompt":"The capital of Japan is","n_predict":32,"clear_kv":true}' \
+  '{"cmd":"generate","id":2,"prompt":"The capital of Japan is","n_predict":32,"clear_kv":true}' \
+| CUDA_VISIBLE_DEVICES= build/cli/bmoe-cli --session \
+    -m DeepSeek-V2-Lite-Q4_0.gguf \
+    -t 4 -c 256 --ubatch 128 \
+    --csv metrics.csv
+```
+
+Report load, the hot turn's prefill total, and hot decode MiB/token. On 2026-09-22, engine still
+reporting 0.23.0, that was:
+
+| | Host A ~30 GiB | Host B 7.6 GiB | Host C 3.6 GiB |
+|---|---:|---:|---:|
+| Load | 8441.02 MiB | 8449.68 | 8450.55 |
+| Hot prefill total (6 prompt tokens) | 0 | 85.03 MiB | 3063.94 MiB |
+| Hot decode | 0 | 0.36 MiB/token | 426.25 MiB/token |
+| Hot majflt/token | 0 | 6.66 | 7134.78 |
+| Hot tok/s (untraced) | 5.12 | 4.55 | 0.92 |
+
+All three caps read the whole file once at load (8441.02 MiB is the file). The cap shows up as
+re-reads. C's 426.25 MiB/token sits between the fault floor (7134.78 × 4 KiB ≈ 27.9 MiB/token)
+and the logical expert touch of 725.77 MiB/token; pages still inside the 2643 MiB file RSS are
+not read again. NVMe over C's hot window (prefill plus 32 decode tokens) was 16931 MiB against
+16709 MiB of process `read_bytes` and 105.61 MiB of zram. Do not quote `majflt_mib` as this
+traffic, and do not set these tok/s next to the traced mmap table in the same file.
 
 ## What the investigation established
 

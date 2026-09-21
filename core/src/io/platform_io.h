@@ -151,6 +151,12 @@ uint64_t mem_available_bytes();
 //     cpu≪wall×threads means the threads were descheduled or blocked (frequency cap, preemption,
 //     fault wait) rather than computing.
 uint64_t major_faults();
+
+// Bytes this process has caused the block layer to fetch since start (`/proc/self/io`
+// `read_bytes`, accounted at submit_bio). Unlike `major_faults()`, a mmap miss counts the
+// whole readahead bio, not one page, and a page-cache hit counts as zero. Zram swap-in is
+// included: it is a bio, but it is not the NVMe device. 0 when `/proc/self/io` cannot be read.
+uint64_t block_read_bytes();
 double process_cpu_seconds();
 
 // Bytes one major fault moves: the page size. Faults are counted, but what a reader wants to know is

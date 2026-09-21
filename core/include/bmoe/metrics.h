@@ -57,6 +57,10 @@ struct TokenMetrics {
     // token is immediately comparable to `read_bytes` — the reads we chose against the reads the
     // kernel forced on us. 0 when faults are unmeasured.
     double majflt_mib = 0.0;
+    // Bytes the block layer fetched for this decode (`/proc/self/io` read_bytes delta). Counts
+    // readahead and zram swap-in; a page-cache hit is zero. Distinct from `read_bytes`, which is
+    // only what the expert FileReader pulled. 0 when the platform cannot report it.
+    uint64_t block_read_bytes = 0;
 
     // ── where memory is, per token (0 when the platform cannot report) ──
     // The split is the point: the expert cache is anonymous, the model's weights are file-backed,
@@ -128,6 +132,8 @@ struct RunSummary {
     // whole process — an upper bound on compute-thread CPU-equivalent time.
     double prefill_cpu_seconds = 0.0;
     double prefill_read_mib = 0.0;
+    // Block-layer bytes fetched during this turn's prefill (same counter as TokenMetrics::block_read_bytes).
+    double prefill_block_read_mib = 0.0;
     double prefill_io_seconds = 0.0;
     double prefill_stall_seconds = 0.0;
     double prefill_mgmt_seconds = 0.0;
@@ -147,6 +153,9 @@ struct RunSummary {
     // well below 1 is a throttled/preempted core. 0 when the platform can't measure them.
     double majflt_per_token = 0.0;
     double cpu_s_per_token = 0.0;
+    // Block-layer bytes fetched inside generation decodes, summed. Per-token average is this
+    // divided by n_generated. 0 when unmeasured. Not FileReader traffic.
+    double block_read_mib = 0.0;
     // Everything between the decodes, per token: the region gen_seconds (and so tok/s) excludes.
     // Includes the tail after the last token, which no row can carry. Read next to s_per_token: the
     // two together are what a caller actually waits through.

@@ -58,13 +58,13 @@ public:
         write_header(); // a caller that never sent RunInfo still gets a readable file
         std::fprintf(f_,
                      "%d,%d,%.3f,%.3f,%.3f,%llu,%.2f,%.3f,%.3f,%llu,%.3f,%.3f,%d,%.2f,%.1f,%.1f,%.1f,"
-                     "%.1f,%.1f,%.1f,%.1f,%.1f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                     "%.1f,%.1f,%.1f,%.1f,%.1f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%llu\n",
                      m.step, m.steps, m.wall_ms, m.io_ms, m.compute_ms, (unsigned long long) m.read_bytes,
                      m.cache_hit_pct, m.stall_ms, m.mgmt_ms, (unsigned long long) m.majflt, m.cpu_ms,
                      m.dense_resident_frac, m.turn, m.majflt_mib, m.cache_budget_mib, m.rss_mib, m.rss_anon_mib,
                      m.rss_file_mib, m.swap_mib, m.mem_available_mib, m.mem_free_mib, m.swap_free_mib,
                      m.loop_overhead_ms, m.mtp_batch, m.mtp_draft_ms, m.drain_ms, m.adopt_ms, m.ra_issue_ms,
-                     m.ra_wd_ms);
+                     m.ra_wd_ms, (unsigned long long) m.block_read_bytes);
         std::fflush(f_);
     }
     void on_summary(const RunSummary & s) override {
@@ -87,6 +87,7 @@ public:
             "evictions=%lld rereads=%lld "
             "prefill_cpu_s=%.3f prefill_read_mib=%.1f prefill_io_s=%.3f "
             "prefill_stall_s=%.3f prefill_mgmt_s=%.3f "
+            "block_read_MiB=%.2f prefill_block_read_mib=%.2f "
             "row_table_MiB=%.1f row_resident_MiB=%.1f row_rows=%lld row_reads=%lld "
             "row_read_MiB=%.1f row_evictions=%lld row_io_errors=%lld\n",
             s.n_generated, s.s_per_token, s.tokens_per_second, s.moe_read_mib, s.moe_io_seconds,
@@ -102,7 +103,8 @@ public:
             s.n_generated ? s.route_ahead_issue_ns / 1e6 / s.n_generated : 0.0,
             s.n_generated ? s.route_ahead_wd_ns / 1e6 / s.n_generated : 0.0, s.moe_drain_s_per_token,
             s.moe_adopt_s_per_token, s.cache_evictions, s.cache_rereads, s.prefill_cpu_seconds, s.prefill_read_mib,
-            s.prefill_io_seconds, s.prefill_stall_seconds, s.prefill_mgmt_seconds, s.row_table_mib, s.row_resident_mib,
+            s.prefill_io_seconds, s.prefill_stall_seconds, s.prefill_mgmt_seconds, s.block_read_mib,
+            s.prefill_block_read_mib, s.row_table_mib, s.row_resident_mib,
             s.row_rows, s.row_slab_reads, s.row_read_mib, s.row_evictions, s.row_io_errors);
         std::fflush(f_);
     }
@@ -124,7 +126,7 @@ private:
         std::fprintf(f_, "step,steps,wall_ms,io_ms,compute_ms,read_bytes,cache_hit_pct,stall_ms,mgmt_ms,majflt,cpu_ms,"
                          "dense_resident_frac,turn,majflt_mib,cache_budget_mib,rss_mib,rss_anon_mib,"
                          "rss_file_mib,swap_mib,mem_available_mib,mem_free_mib,swap_free_mib,loop_overhead_ms,"
-                         "mtp_batch,mtp_draft_ms,drain_ms,adopt_ms,ra_issue_ms,ra_wd_ms\n");
+                         "mtp_batch,mtp_draft_ms,drain_ms,adopt_ms,ra_issue_ms,ra_wd_ms,block_read_bytes\n");
     }
 
     std::FILE * f_ = nullptr;

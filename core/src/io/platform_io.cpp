@@ -138,6 +138,9 @@ uint64_t mem_available_bytes() {
 uint64_t major_faults() {
     return 0;
 }
+uint64_t block_read_bytes() {
+    return 0;
+}
 double process_cpu_seconds() {
     return 0.0;
 }
@@ -291,6 +294,21 @@ uint64_t major_faults() {
     // RUSAGE_SELF aggregates every thread of the process, matching the multi-threaded decode.
     struct rusage ru;
     return getrusage(RUSAGE_SELF, &ru) == 0 ? (uint64_t) ru.ru_majflt : 0;
+}
+
+uint64_t block_read_bytes() {
+    // submit_bio charges the faulting thread for the whole bio, readahead included. /proc/pid/io
+    // sums the thread group, so one read here matches a multi-threaded decode. No procfs (macOS)
+    // leaves the counter unmeasured, the same contract as a missing getrusage.
+    std::FILE * f = std::fopen("/proc/self/io", "r");
+    if (!f) return 0;
+    char line[128];
+    unsigned long long bytes = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::sscanf(line, "read_bytes: %llu", &bytes) == 1) break;
+    }
+    std::fclose(f);
+    return (uint64_t) bytes;
 }
 
 double process_cpu_seconds() {

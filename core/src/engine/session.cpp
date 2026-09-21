@@ -115,6 +115,7 @@ struct GenTally {
     double prev_drain_s = 0.0;
     double prev_adopt_s = 0.0;
     uint64_t majflt = 0;
+    uint64_t block_read_bytes = 0;
     double cpu_seconds = 0.0;
 
     // Fill in everything a generated token is measured by — its wall/fault/CPU decomposition, the
@@ -125,15 +126,18 @@ struct GenTally {
     // `wall` is the decode's wall time in seconds and `faults`/`cpu_s` the deltas measured around
     // that same decode; `st` is the expert source's stats, or null when streaming is off.
     void
-    record(TokenMetrics & m, double wall, uint64_t faults, double cpu_s, int turn, const IExpertSource::Stats * st) {
+    record(TokenMetrics & m, double wall, uint64_t faults, uint64_t block_read, double cpu_s, int turn,
+           const IExpertSource::Stats * st) {
         m.wall_ms = wall * 1000.0;
         // Fault/CPU decomposition is independent of streaming — dense-weight faults show up in the
         // mmap baseline too — so record it for every token before the moe/no-moe split below.
         m.majflt = faults;
+        m.block_read_bytes = block_read;
         m.cpu_ms = cpu_s * 1000.0;
         m.majflt_mib = (double) m.majflt * (double) pio::fault_bytes() / (1024.0 * 1024.0);
         m.turn = turn;
         majflt += m.majflt;
+        block_read_bytes += block_read;
         cpu_seconds += cpu_s;
 
         // Read the memory picture AFTER the decode, outside the caller's timing bracket: two /proc
@@ -202,10 +206,12 @@ struct GenTally {
 struct PrefillTally {
     IExpertSource::Stats pre;
     double cpu0 = 0.0;
+    uint64_t block0 = 0;
 
     // Deltas across this turn's prefill chunks — valid after end().
     double cpu_seconds = 0.0;
     double read_mib = 0.0;
+    double block_read_mib = 0.0;
     double io_seconds = 0.0;
     double stall_seconds = 0.0;
     double mgmt_seconds = 0.0;
@@ -216,10 +222,13 @@ struct PrefillTally {
     void begin(bool moe_on, const IExpertSource & src) {
         pre = moe_on ? src.stats() : IExpertSource::Stats{};
         cpu0 = pio::process_cpu_seconds();
+        block0 = pio::block_read_bytes();
     }
     void end(bool moe_on, const IExpertSource & src) {
         post = moe_on ? src.stats() : IExpertSource::Stats{};
         cpu_seconds = pio::process_cpu_seconds() - cpu0;
+        const uint64_t block1 = pio::block_read_bytes();
+        block_read_mib = (double) (block1 - block0) / (1024.0 * 1024.0);
         read_mib = (double) ((long long) post.read_bytes - (long long) pre.read_bytes) / (1024.0 * 1024.0);
         io_seconds = post.read_seconds - pre.read_seconds;
         stall_seconds = post.stall_seconds - pre.stall_seconds;
@@ -266,6 +275,7 @@ struct Session::Impl {
     SessionConfig cfg;
     std::string arch;
     double load_seconds = 0.0;
+    uint64_t load_block_read_bytes = 0;
 
     // Ownership order matters at teardown: the source's I/O pool holds fds into the mmap'd
     // file and its buffers back the rebound expert tensors, so it must be shut down before
@@ -385,6 +395,9 @@ Session::~Session() = default;
 
 double Session::load_seconds() const {
     return impl_->load_seconds;
+}
+uint64_t Session::load_block_read_bytes() const {
+    return impl_->load_block_read_bytes;
 }
 const std::string & Session::arch() const {
     return impl_->arch;
@@ -592,6 +605,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     im.backend_inited = true;
 
     const auto t_load0 = clock_t_::now();
+    const uint64_t block_load0 = pio::block_read_bytes();
 
     // The gguf header answers several separate questions below — the arch-prefixed key for a
     // top-k override, the route trace's effective top-k, the run info's top-k/expert count, and
@@ -1159,6 +1173,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     }
 
     im.load_seconds = secs(t_load0, clock_t_::now());
+    im.load_block_read_bytes = pio::block_read_bytes() - block_load0;
     return self;
 }
 
@@ -1589,6 +1604,7 @@ RunResult Session::generate(const GenerateRequest & req,
         // Bracket ONLY the decode: major faults and CPU-time deltas here decompose this token's
         // compute residual into flash-fault stalls vs. genuine (or throttled) computation.
         const uint64_t f0 = pio::major_faults();
+        const uint64_t b0 = pio::block_read_bytes();
         const double c0 = pio::process_cpu_seconds();
         auto s0 = clock_t_::now();
         const double overhead = secs(loop_mark, s0); // everything since the previous decode returned
@@ -1598,6 +1614,7 @@ RunResult Session::generate(const GenerateRequest & req,
         auto s1 = clock_t_::now();
         loop_mark = s1; // the next token's overhead is measured from here
         const uint64_t f1 = pio::major_faults();
+        const uint64_t b1 = pio::block_read_bytes();
         const double c1 = pio::process_cpu_seconds();
         if (dec != 0) {
             if (im.cancel_requested.load(std::memory_order_relaxed)) {
@@ -1720,9 +1737,9 @@ RunResult Session::generate(const GenerateRequest & req,
                 m.reasoning = std::move(sv.reasoning);
             }
             if (e == 0)
-                tally.record(m, wall, f1 - f0, c1 - c0, im.turn, moe.enabled ? &st : nullptr);
+                tally.record(m, wall, f1 - f0, b1 - b0, c1 - c0, im.turn, moe.enabled ? &st : nullptr);
             else
-                tally.record(m, 0.0, 0, 0.0, im.turn, moe.enabled ? &st : nullptr);
+                tally.record(m, 0.0, 0, 0, 0.0, im.turn, moe.enabled ? &st : nullptr);
             if (on_token) on_token(m);
             if (sink) sink->on_token(m);
         }
@@ -1774,10 +1791,12 @@ RunResult Session::generate(const GenerateRequest & req,
     s.prefill_seconds = prefill_seconds;
     s.prefill_cpu_seconds = prefill_tally.cpu_seconds;
     s.prefill_read_mib = prefill_tally.read_mib;
+    s.prefill_block_read_mib = prefill_tally.block_read_mib;
     s.prefill_io_seconds = prefill_tally.io_seconds;
     s.prefill_stall_seconds = prefill_tally.stall_seconds;
     s.prefill_mgmt_seconds = prefill_tally.mgmt_seconds;
     s.majflt_per_token = n_gen ? (double) tally.majflt / n_gen : 0.0;
+    s.block_read_mib = tally.block_read_bytes / (1024.0 * 1024.0);
     s.cpu_s_per_token = n_gen ? tally.cpu_seconds / n_gen : 0.0;
     if (moe.enabled) {
         IExpertSource::Stats st = im.source.stats();

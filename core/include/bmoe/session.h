@@ -187,6 +187,8 @@ public:
     void cancel();
 
     double load_seconds() const;      // model load + streaming setup, measured once at open()
+    // Block-layer bytes fetched during open() (model mapping and capture). 0 when unmeasured.
+    uint64_t load_block_read_bytes() const;
     const std::string & arch() const; // model architecture ("qwen3moe", "gemma4", …)
     int n_ctx() const;
 
