@@ -7,6 +7,7 @@ It follows the [AGENTS.md](https://agents.md) convention, so any coding agent pi
 Quick navigation: [hard rules](#hard-rules), [build](#build-and-test),
 [execution/cache](#execution-and-cache-model), [page cache](#page-cache-exact-scope-of-bypass),
 [cgroups](#memory-budgets-and-cgroups), [profiling](#traces-and-measurement-semantics),
+[test modes](#allowed-test-modes),
 [mmap bytes](#mmap-block-layer-traffic),
 [measured findings](#what-the-investigation-established), [open questions](#interpretation-limits-and-deferred-work).
 
@@ -409,6 +410,97 @@ corresponds to trace position `n_prompt`; account for the one-based offset and t
 when joining them. Speculative batches and reused KV need their actual positions, not a
 blind prompt-length subtraction.
 
+## Allowed test modes
+
+Measurements on this branch use exactly one of the two residency modes below.
+Anything else is undefined and is not allowed: a different cache budget, `--overlap`,
+`--dense-weights` other than the value named by the mode, `--no-odirect`, `--row-stream`,
+`--release-mmap`, `--load-all`, prefetch, route-ahead, expert dropping, MTP, n-gram,
+`--compute-trace`, `--io-trace`, a different model, prompt, token count, thread count,
+context, or ubatch. Stop and ask the user whether to add a new rule. Do not run the
+variant while waiting for the answer.
+
+`--moe-stream` with no `--cache-mb` is not the offload mode. The CLI turns `cache_auto`
+on in that case. Do not set `BMOE_*` environment variables; they override flags silently.
+
+Both modes share this protocol. Host labels and the board build are in the
+[Jetson AGX record](docs/experiment/2026-09-21-jetson-agx-mmap-q4-0.md). Phrase the
+boards as Host A / B / C (~30 / 7.6 / 3.6 GiB visible). The smaller two are kernel
+`mem=` caps. Do not publish hostnames, addresses, or local paths.
+
+- Model: DeepSeek-V2-Lite pure `Q4_0`, file 8,851,045,376 bytes. GPU off.
+- `POSIX_FADV_DONTNEED` on that file only, before the process. Never drop the global page cache.
+- Greedy. `-t 4 -c 256`. `--ubatch 128` on A/B, `64` on C.
+- One process, two `generate` requests, prompt `The capital of Japan is` (6 tokens),
+  `n_predict` 32, `clear_kv=true`. Turn 0 is cold. Turn 1 is hot.
+- `clear_kv` drops KV only. It does not drop file pages or the expert slots.
+
+### Mode `mmap`
+
+Ordinary llama.cpp mapping. Do not pass `--moe-stream`. Expert and non-expert weights
+stay file-backed. The kernel page cache decides what stays resident. There is no
+`FileReader`, so `read_mib` stays 0. SSD bytes are `block_read_*` (`/proc/self/io`
+`read_bytes`). The counter glossary and the 2026-09-22 results are under
+[Mmap block-layer traffic](#mmap-block-layer-traffic).
+
+```bash
+printf '%s\n' \
+  '{"cmd":"generate","id":1,"prompt":"The capital of Japan is","n_predict":32,"clear_kv":true}' \
+  '{"cmd":"generate","id":2,"prompt":"The capital of Japan is","n_predict":32,"clear_kv":true}' \
+| CUDA_VISIBLE_DEVICES= build/cli/bmoe-cli --session \
+    -m DeepSeek-V2-Lite-Q4_0.gguf \
+    -t 4 -c 256 --ubatch 128 \
+    --csv metrics.csv
+```
+
+Confirm the log has no `expert streaming ON`. On the 4 GiB-visible host, change
+`--ubatch 128` to `--ubatch 64`.
+
+### Mode `odirect-offload`
+
+Dense weights are loaded once into anonymous memory. Routed experts are offloaded:
+every selected slice is read from the file for that token and is not kept in an LRU.
+
+The command has to carry all three switches. `--dense-weights anon` reads every
+non-routed tensor once, through the dense reader's own `O_DIRECT`, into an anonymous
+buffer and rebinds it. On this `Q4_0` file that set is about 715 MiB and includes the
+leading dense FFN, MLA, embeddings, norms, the router, and the shared experts
+(`ffn_*_shexp`, about 241 MiB). The expert LRU does not evict those buffers. Under
+memory pressure the kernel may still swap the anonymous pages to zram; that is outside
+this rule.
+
+`--cache-mb 0` is the offload. All layers share a few slots. The callback on
+`ffn_moe_topk-<layer>` (`ask == false`) calls `load_layer`, which `pread`s the routed
+experts with `O_DIRECT` into the slot. The next layer overwrites it. There is no
+`(layer, expert)` LRU. A positive cache budget or `cache_auto` is a different policy
+and is not this mode.
+
+Expert `O_DIRECT` is the default (`o_direct` starts true). Do not pass `--no-odirect`.
+After open, the log must show `expert streaming ON` with `o_direct=1` and `cache=0`,
+and `dense-weights=anon`. If `o_direct=0`, direct I/O was refused or failed its
+open-time check and the run is not this mode: stop and ask.
+
+Expert traffic for this mode is FileReader `read_mib` / CSV `read_bytes`. `block_read_*`
+is the cross-check (those bios, plus zram). The one-time dense read shows up in
+`load_block_read_mib`, not in the per-token expert figure.
+
+```bash
+printf '%s\n' \
+  '{"cmd":"generate","id":1,"prompt":"The capital of Japan is","n_predict":32,"clear_kv":true}' \
+  '{"cmd":"generate","id":2,"prompt":"The capital of Japan is","n_predict":32,"clear_kv":true}' \
+| CUDA_VISIBLE_DEVICES= build/cli/bmoe-cli --session \
+    --moe-stream --cache-mb 0 --dense-weights anon \
+    -m DeepSeek-V2-Lite-Q4_0.gguf \
+    -t 4 -c 256 --ubatch 128 --io-threads 4 \
+    --csv metrics.csv
+```
+
+On the 4 GiB-visible host, use `--ubatch 64`. A traced cell of this residency
+(`--io-threads 2`, `--compute-trace`, `--io-trace`) is Appendix B of the Jetson record:
+725.77 MiB/token expert reads, `o_direct=1`, dense anon 715 MiB, on all three hosts.
+That cell's tok/s includes trace barriers and a different I/O thread count. Quote its
+bytes as that cell. Do not quote its tok/s as a result of the command above.
+
 ## Mmap block-layer traffic
 
 Ordinary mmap has no `FileReader`, so CSV `read_bytes` / `read_mib` stay 0. The byte counter is
@@ -431,31 +523,10 @@ at a sample, not bytes transferred: a reclaimed page can be read again while RSS
 `clear_kv=true` drops KV only. The next `generate` still prefills the prompt. File pages survive
 that drop, so a hot turn's prefill is zero only when those pages are still resident.
 
-Repeat the 2026-09-22 measurement as follows. Full tables:
+The invocation, the host labels, and the rule that this is one of only two allowed modes
+are under [Allowed test modes](#allowed-test-modes). Full tables:
 [Jetson AGX mmap record](docs/experiment/2026-09-21-jetson-agx-mmap-q4-0.md). The board build
-(CPU only, `GGML_NATIVE=OFF`, `-march=armv8.2-a+fp16`) is in that file. A non-interactive shell
-may not see the cmake that configured an existing tree; use the cache's `CMAKE_COMMAND`.
-
-- Three boards, same SoC class, visible RAM about 30 / 7.6 / 3.6 GiB. The smaller two are kernel
-  `mem=` caps, not cgroup `memory.max`. Phrase them as Host A / B / C. Do not publish hostnames,
-  addresses, or local paths.
-- Model: DeepSeek-V2-Lite pure `Q4_0` (file 8,851,045,376 bytes). Prompt `The capital of Japan is`
-  (6 tokens). Greedy. `-t 4 -c 256`. `--ubatch 128` on A/B, `64` on C. No `--moe-stream`. Leave
-  `--compute-trace` off: the traced time-split table is a different run, and its tok/s are not
-  comparable to this one.
-- `POSIX_FADV_DONTNEED` on that model file only, before the process. Never drop the global page
-  cache.
-- One process, two `generate` requests, `clear_kv=true`. Turn 0 is cold. Turn 1 is hot.
-
-```bash
-printf '%s\n' \
-  '{"cmd":"generate","id":1,"prompt":"The capital of Japan is","n_predict":32,"clear_kv":true}' \
-  '{"cmd":"generate","id":2,"prompt":"The capital of Japan is","n_predict":32,"clear_kv":true}' \
-| CUDA_VISIBLE_DEVICES= build/cli/bmoe-cli --session \
-    -m DeepSeek-V2-Lite-Q4_0.gguf \
-    -t 4 -c 256 --ubatch 128 \
-    --csv metrics.csv
-```
+(CPU only, `GGML_NATIVE=OFF`, `-march=armv8.2-a+fp16`) is in that file.
 
 Report load, the hot turn's prefill total, and hot decode MiB/token. On 2026-09-22, engine still
 reporting 0.23.0, that was:
