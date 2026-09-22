@@ -13,6 +13,11 @@ namespace bmoe {
 static const MoeRecipe k_recipes[] = {
     {"qwen3moe", {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}},
     {"qwen2moe", {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}},
+    // This llama.cpp converts MixtralForCausalLM onto the llama graph, so the gguf
+    // architecture string is "llama" while the expert tensors are the standard split
+    // (ffn_{gate,up,down}_exps) and the router node is ffn_moe_topk. A dense llama
+    // passed to --moe-stream has none of those tensors and fails at bind.
+    {"llama", {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}},
     // qwen35moe (Qwen3.5 MoE, e.g. 35B-A3B) is a hybrid attention/SSM stack: some layers run
     // full attention, others a Mamba-style SSM block, but every MoE layer names its experts
     // with the standard split suffixes, so streaming is one row. There is also an always-on
