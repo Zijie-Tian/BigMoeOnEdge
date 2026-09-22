@@ -43,6 +43,7 @@ for the idea the project is built on.
 | [warmup-analysis.md](warmup-analysis.md) | Why first tokens are slow, and the two regimes behind it. |
 | [cpu-profiling-findings.md](cpu-profiling-findings.md) | Host CPU / cgroup-v2 retrospective: tiny-fixture identity, a misleading undersized-cache run, warm replay, synthetic caps, and DeepSeek-V2-Lite. Not a phone benchmark. |
 | [experiment/2026-09-21-jetson-agx-mmap-q4-0.md](experiment/2026-09-21-jetson-agx-mmap-q4-0.md) | Jetson AGX mmap vs O_DIRECT streaming, DeepSeek-V2-Lite pure Q4_0, three kernel `mem=` caps. Hot mmap is the headline. The 2026-09-22 section is the block-layer byte measurement: hot decode 0 / 0.36 / 426.25 MiB/token. |
+| [experiments/moehit.md](experiments/moehit.md) | Expert-cache sweep, 0–28 GiB, on one ~30 GiB AGX. Mixtral-8x7B, DeepSeek-V2-Lite, Qwen1.5-MoE-A2.7B, and Qwen2-57B-A14B, all pure Q4_0. |
 | [bench-data/](bench-data/) | Raw per-run CSVs and session notes. A dated archive — see its README. |
 
 Every benchmark figure in these docs is measured on the hardware named beside it. If you
