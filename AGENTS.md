@@ -8,6 +8,8 @@ Quick navigation: [hard rules](#hard-rules), [build](#build-and-test),
 [execution/cache](#execution-and-cache-model), [page cache](#page-cache-exact-scope-of-bypass),
 [cgroups](#memory-budgets-and-cgroups), [profiling](#traces-and-measurement-semantics),
 [test modes](#allowed-test-modes),
+[thread bottleneck](#thread-bottleneck-procedure),
+[thread heatmap](#joint-thread-heatmap),
 [mmap bytes](#mmap-block-layer-traffic),
 [measured findings](#what-the-investigation-established), [open questions](#interpretation-limits-and-deferred-work).
 
@@ -423,6 +425,10 @@ variant while waiting for the answer.
 `--moe-stream` with no `--cache-mb` is not the offload mode. The CLI turns `cache_auto`
 on in that case. Do not set `BMOE_*` environment variables; they override flags silently.
 
+The [thread-bottleneck procedure](#thread-bottleneck-procedure) is the one authorized
+way to vary `--cache-mb`, `-t`, and `--io-threads` when the question is which pool
+dominates serial hot decode. It does not relax this section for any other knob.
+
 Both modes share this protocol. Host labels and the board build are in the
 [Jetson AGX record](docs/experiment/2026-09-21-jetson-agx-mmap-q4-0.md). Phrase the
 boards as Host A / B / C (~30 / 7.6 / 3.6 GiB visible). The smaller two are kernel
@@ -500,6 +506,140 @@ On the 4 GiB-visible host, use `--ubatch 64`. A traced cell of this residency
 725.77 MiB/token expert reads, `o_direct=1`, dense anon 715 MiB, on all three hosts.
 That cell's tok/s includes trace barriers and a different I/O thread count. Quote its
 bytes as that cell. Do not quote its tok/s as a result of the command above.
+
+## Thread-bottleneck procedure
+
+Use this when the question is, at one fixed expert-cache budget, whether serial
+hot-decode wall time is limited by the compute-thread pool or by the I/O lanes,
+and which of those two knobs still moves it. The measured cells and how to read
+them are in
+[the 2026-09-27 record](docs/experiment/2026-09-27-x86-thread-bottleneck.md).
+Do not place those tok/s next to the Jetson traced tables.
+
+This is the authorized exception to the two residency modes above for
+`--cache-mb`, `-t`, and `--io-threads` on DeepSeek-V2-Lite pure `Q4_0`. It does
+not authorize `--overlap`, traces, a different model, prompt, token count,
+context, or ubatch. Anything else still stops for a new rule.
+
+Every cell shares this fixed protocol.
+
+- Model file 8,851,045,376 bytes. GPU off. The binary must not link CUDA, and
+  the log must assign every layer to CPU. `CUDA_VISIBLE_DEVICES=` is not that
+  proof by itself.
+- `--moe-stream --dense-weights anon`. Do not pass `--overlap`, `--no-odirect`,
+  `--row-stream`, `--release-mmap`, `--load-all`, prefetch, route-ahead, expert
+  dropping, MTP, n-gram, `--compute-trace`, or `--io-trace`.
+- Do not set `BMOE_*` environment variables.
+- Greedy. Prompt `The capital of Japan is`, `n_predict` 32, `-c 256`,
+  `--ubatch 128`.
+- One fresh process per cell. Two `generate` requests, both `clear_kv=true`.
+  Turn 0 is cold. Turn 1 is hot.
+- `POSIX_FADV_DONTNEED` on that file only, before the process. Never drop the
+  global page cache.
+- Two repetitions. A new process for each one.
+- Serial mode. `--io-threads N` is the lane count printed in the banner. The
+  callback thread reads lane 0; the I/O pool owns lanes 1..N-1. Check
+  `io_threads=N` in the log and the CSV, not the pthread count.
+
+Hold one `--cache-mb` for a whole matrix. `0` is the shared slot. A positive
+budget is the `(layer, expert)` LRU. A budget below 1500 MiB other than 0 needs
+`--force-cache`. The recorded budgets are 0, 4096, and 8192. Do not move the
+budget inside a matrix.
+
+Two sweeps, one factor each. These two sweeps do not cross the knobs. The
+joint surface is the separate procedure in
+[Joint thread heatmap](#joint-thread-heatmap).
+
+1. I/O lanes, compute threads fixed at 4: `--io-threads` 1, 2, 4, 8.
+2. Compute threads, I/O lanes fixed at 4: `-t` 1, 2, 4, 8, 16, 32, 64.
+
+The `-t 4 --io-threads 4` cell belongs to both sweeps. Run it once per
+repetition and reuse it.
+
+```bash
+printf '%s\n' \
+  '{"cmd":"generate","id":1,"prompt":"The capital of Japan is","n_predict":32,"clear_kv":true}' \
+  '{"cmd":"generate","id":2,"prompt":"The capital of Japan is","n_predict":32,"clear_kv":true}' \
+| CUDA_VISIBLE_DEVICES= build/cli/bmoe-cli --session \
+    --moe-stream --cache-mb 4096 --dense-weights anon \
+    -m DeepSeek-V2-Lite-Q4_0.gguf \
+    -t 4 -c 256 --ubatch 128 --io-threads 4 \
+    --csv metrics.csv
+```
+
+Change only `--cache-mb`, `-t`, or `--io-threads` between cells. After every
+process, require all of the following. Stop the matrix on the first miss.
+
+- Log: `expert streaming ON`, `o_direct=1`, `dense-weights=anon`, and
+  `cache=<the requested number> MiB`.
+- CSV header: `overlap=0`, `threads=<t>`, `io_threads=<n>`, `o_direct=1`.
+- Both turns: 32 generated tokens, 6 prompt tokens, not cancelled, identical
+  text. Every cell of the matrix must share that text.
+- No layer line says a device other than CPU.
+
+Expert read for a turn is `read_mib / 32`. In this serial mode `io_s_tok` is
+the blocked read phase and adds with `compute_s_tok` toward the token wall.
+Keep both repetitions. When the two hot tok/s differ by a large factor, report
+the pair. Do not publish their mean as the rate.
+
+Read a finished matrix in this order.
+
+- At `-t 4 --io-threads 4`, compare hot `io_s_tok` and `compute_s_tok`. The
+  larger residual is the heavier slice of that cell.
+- The I/O sweep says something about storage only when hot `read_mib/32` is
+  nonzero. A hot read of zero means the lanes have nothing to issue on that
+  turn. Read the cold turn before describing the process as free of I/O:
+  `clear_kv` does not drop the expert cache, and the cold turn is the one
+  that fills it.
+- An I/O-lane effect is hot `io_s_tok` falling as the lane count rises, with
+  `compute_s_tok` staying in the same band and tok/s rising. A tok/s change
+  that comes with a jump in `compute_s_tok` is not an I/O result.
+- A compute-thread effect is hot `compute_s_tok` falling as `-t` rises while
+  `io_s_tok` stays in band. Once compute drops below the read, further compute
+  threads stop moving tok/s. The floor is the read.
+- `cpu_s_tok` divided by the token wall, near the requested `-t`, means the
+  compute pool is busy. A high ratio together with a worse tok/s means the
+  extra threads are occupied and are not shortening the token.
+
+On the recorded host, cache 0 (725.77 MiB/token) has both slices on the
+critical path, and lanes 1 through 4 shorten the read. At 4 GiB (169.23
+MiB/token, resident 4093 MiB) compute is slightly heavier at 4 threads, and
+from 16 threads the ~0.07 s read is what remains. At 8 GiB the hot read is 0,
+resident 6191 MiB, and the hot turn moves with `-t` through 16 threads. Those
+sentences are the finding of that record, not a quota for the next host.
+
+Describe the machine as socket count, NUMA nodes, physical cores, logical
+CPUs, and approximate RAM. No hostname, address, device model code, or local
+path. Threads stay unpinned. Other processes can still run on those cores.
+
+### Joint thread heatmap
+
+Use this when the question is the joint surface of compute threads and I/O
+lanes, drawn as one heatmap. It is the cartesian product of the two lists
+above, at one fixed `--cache-mb`. It does not authorize a second cache inside
+the same figure, `--overlap`, traces, or any other knob.
+
+- X axis: `--io-threads` 1, 2, 4, 8.
+- Y axis: `-t` 1, 2, 4, 8, 16, 32, 64.
+- Every pair is its own process, repeated twice. Same fixed protocol as the
+  procedure above, including the per-process checks. Stop on the first miss.
+- The recorded surface is cache 0. A 4096 or 8192 surface is the same grid
+  with only `--cache-mb` changed, and only when that budget was asked for.
+- The cell value is hot tok/s. Plot the mean of the two repetitions. Annotate
+  every cell. If the two repetitions differ by more than a quarter, print the
+  pair beside the figure. Do not let the mean hide that split.
+- Expert read stays in the caption. A surface whose hot read is not constant
+  across cells is not one residency, and the figure is not comparable inside
+  itself.
+
+The cache-0 surface measured on 2026-09-27 is in
+[the record](docs/experiment/2026-09-27-x86-thread-bottleneck.md), with
+`docs/experiment/2026-09-27-x86-cache0-thread-heatmap.png`. Every hot read was
+725.77 MiB/token. The fastest mean was 10.64 tok/s at 32 compute threads and
+4 I/O lanes (10.88 and 10.40). One I/O lane stayed near 2–3.7 tok/s at every
+compute width. One compute thread stayed near 2.1–2.6 tok/s at every lane
+count. Eight lanes beat four at 8 and 16 compute threads, and lost to four at
+32. Sixty-four compute threads at 4 lanes was 7.17 tok/s.
 
 ## Mmap block-layer traffic
 
