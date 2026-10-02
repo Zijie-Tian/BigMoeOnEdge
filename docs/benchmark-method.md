@@ -6,6 +6,10 @@ How to measure this engine on any machine, and how to read what comes out.
   fixed protocol and one command.
 - Want to tune, sweep, or understand a number? You are in the right place.
 - Want the results? [benchmarks.md](benchmarks.md).
+- Want the controlled serial thread/cache study? The
+  [12-core ARM64 record](experiment/DeepSeek-V2-Lite-多主机内存线程与存储性能测试.md) uses
+  two same-process 32-token requests, three fixed expert-cache budgets, and no
+  overlap or traces. Its named protocol is separate from the general run below.
 
 Nothing here is specific to one device. Numbers are quoted to illustrate a mechanism; the hardware
 behind the published figures is named [at the end](#where-the-published-numbers-come-from).
@@ -86,13 +90,27 @@ system; `--cache-ceil-mb` caps it. Two ways to get it wrong:
 Size it from the *model*: the run prints MiB read per token, and a few times that is where the hit
 rate stops moving. See [cache-sizing.md](cache-sizing.md).
 
-**Read lanes.** 4 is the plateau on flash for the request sizes the streamer issues. Fewer leave
-bandwidth unused; more do nothing once the drive is saturated, and can hurt on storage that
-penalises small requests. If stall s/tok will not fall when you raise them, the drive is the limit,
-not the queue: compare `Flash/token` over the measured read rate against the stall.
+**Read lanes.** More lanes allow missing expert slices to be read concurrently. Check that the
+selected turn actually reads experts, then compare read-phase time while holding compute threads,
+cache budget, and read volume fixed. In the
+[12-core ARM64 study](experiment/DeepSeek-V2-Lite-多主机内存线程与存储性能测试.md),
+one to four lanes brought substantial gains at 4 GiB cache; four to eight brought only a small
+additional gain. At 8/16 GiB, hot expert reads were zero, so the I/O columns did not measure read
+parallelism. A plateau is not proof of a drive limit: finite per-layer jobs, request granularity,
+copies, and scheduling can also limit the read phase. FileReader bytes divided by that phase's
+wall time measure effective service for this workload, not the physical device's peak bandwidth.
+The same consolidated report's [read-only fio comparison](experiment/DeepSeek-V2-Lite-多主机内存线程与存储性能测试.md)
+measured 4.78 GB/s with continuous expert-sized random reads at eight workers,
+versus 2.81 GB/s during real inference's loading phase. Request size and concurrency
+match, but offsets, submission cadence, and memory-copy work differ; the comparison
+does not isolate a single cause or predict an achievable inference speedup.
 
-**Threads.** The curve is a U, not a ramp. Past the big-core count the extra threads contend and
-each layer's tail gets longer. Start at `min(8, cores)`; on big.LITTLE try the big cores alone.
+**Threads.** Measure the curve on the target machine; more threads need not shorten a token.
+In the same ARM64 study, the fastest sampled 4 GiB cell used ten compute threads, while the
+fully cached hot matrices peaked at twelve. These are sampled optima, not a universal core-count
+rule. `compute_ms` is wall time left after the measured read and management terms in serial mode;
+it includes memory/cache access and synchronization as well as arithmetic. A large residual
+identifies an execution-path target, not proof that the CPU arithmetic units are saturated.
 
 **Dense weights.** The biggest lever once the model is well past RAM, and picking it wrong changes
 *what* you measure, not just how fast it is:

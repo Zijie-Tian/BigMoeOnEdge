@@ -430,7 +430,7 @@ way to vary `--cache-mb`, `-t`, and `--io-threads` when the question is which po
 dominates serial hot decode. It does not relax this section for any other knob.
 
 Both modes share this protocol. Host labels and the board build are in the
-[Jetson AGX record](docs/experiment/2026-09-21-jetson-agx-mmap-q4-0.md). Phrase the
+[consolidated experiment record](docs/experiment/DeepSeek-V2-Lite-多主机内存线程与存储性能测试.md). Phrase the
 boards as Host A / B / C (~30 / 7.6 / 3.6 GiB visible). The smaller two are kernel
 `mem=` caps. Do not publish hostnames, addresses, or local paths.
 
@@ -513,7 +513,7 @@ Use this when the question is, at one fixed expert-cache budget, whether serial
 hot-decode wall time is limited by the compute-thread pool or by the I/O lanes,
 and which of those two knobs still moves it. The measured cells and how to read
 them are in
-[the 2026-09-27 record](docs/experiment/2026-09-27-x86-thread-bottleneck.md).
+[the consolidated experiment record](docs/experiment/DeepSeek-V2-Lite-多主机内存线程与存储性能测试.md).
 Do not place those tok/s next to the Jetson traced tables.
 
 This is the authorized exception to the two residency modes above for
@@ -543,8 +543,9 @@ Every cell shares this fixed protocol.
 
 Hold one `--cache-mb` for a whole matrix. `0` is the shared slot. A positive
 budget is the `(layer, expert)` LRU. A budget below 1500 MiB other than 0 needs
-`--force-cache`. The recorded budgets are 0, 4096, and 8192. Do not move the
-budget inside a matrix.
+`--force-cache`. The recorded x86 budgets are 0, 4096, and 8192. The separate
+[12-core ARM64 protocol](#12-core-arm64-cache-thread-heatmaps) records 4096,
+8192, and 16384. Do not move the budget inside a matrix.
 
 Two sweeps, one factor each. These two sweeps do not cross the knobs. The
 joint surface is the separate procedure in
@@ -595,8 +596,10 @@ Read a finished matrix in this order.
   `compute_s_tok` staying in the same band and tok/s rising. A tok/s change
   that comes with a jump in `compute_s_tok` is not an I/O result.
 - A compute-thread effect is hot `compute_s_tok` falling as `-t` rises while
-  `io_s_tok` stays in band. Once compute drops below the read, further compute
-  threads stop moving tok/s. The floor is the read.
+  `io_s_tok` stays in band. As the remaining read/management costs become the
+  larger share, compute acceleration has diminishing returns. Serial wall time
+  adds these terms; it is not their maximum, and crossing below the read time
+  does not by itself make every further compute improvement ineffective.
 - `cpu_s_tok` divided by the token wall, near the requested `-t`, means the
   compute pool is busy. A high ratio together with a worse tok/s means the
   extra threads are occupied and are not shortening the token.
@@ -632,14 +635,89 @@ the same figure, `--overlap`, traces, or any other knob.
   across cells is not one residency, and the figure is not comparable inside
   itself.
 
-The cache-0 surface measured on 2026-09-27 is in
-[the record](docs/experiment/2026-09-27-x86-thread-bottleneck.md), with
-`docs/experiment/2026-09-27-x86-cache0-thread-heatmap.png`. Every hot read was
+The cache-0 surface measured on 2026-09-27 is tabulated in
+[the consolidated record](docs/experiment/DeepSeek-V2-Lite-多主机内存线程与存储性能测试.md). Every hot read was
 725.77 MiB/token. The fastest mean was 10.64 tok/s at 32 compute threads and
 4 I/O lanes (10.88 and 10.40). One I/O lane stayed near 2–3.7 tok/s at every
 compute width. One compute thread stayed near 2.1–2.6 tok/s at every lane
 count. Eight lanes beat four at 8 and 16 compute threads, and lost to four at
 32. Sixty-four compute threads at 4 lanes was 7.17 tok/s.
+
+### 12-core ARM64 cache-thread heatmaps
+
+The user-approved 12-core host protocol is a separate grid from the x86 surface
+above: compute threads **1, 2, 4, 6, 8, 10, 12**, I/O lanes **1, 2, 4, 6, 8**,
+and expert-cache budgets **4096, 8192, 16384 MiB**, one fixed budget per matrix.
+Keep the same model, prompt, two 32-token turns, context 256, ubatch 128,
+CPU-only serial O_DIRECT, dense anon, disabled features, and per-process checks.
+These budgets do not impose process or host RAM limits. Do not filter the grid
+by adding compute and I/O widths: they are pool widths, not disjoint core sets.
+
+Each budget has 35 cells and two fresh-process repetitions. Use the same seeded
+permutation and its reverse; run one benchmark process at a time. The completed
+2026-09-27 campaign has 210 validated processes and is recorded with three
+numeric matrices and embedded aggregate data in
+[the consolidated experiment report](docs/experiment/DeepSeek-V2-Lite-多主机内存线程与存储性能测试.md).
+All hot reads were 130.85 MiB/token at 4 GiB and zero at 8/16 GiB. Actual hot
+expert residency was 4093 / 5778 / 5778 MiB, not the requested ceilings.
+
+Do not equate `compute_ms` with isolated arithmetic time or infer a device
+bandwidth limit from an I/O-lane plateau. The process block-I/O counter was
+unavailable on this host: `/proc/self/io` was absent and the helper returned
+zero. Its recorded `block_read_*` zeros are not evidence of zero disk traffic;
+use the measured FileReader bytes for these expert-streaming results.
+
+### Direct expert-load bandwidth check
+
+The separately authorized follow-up uses cache **4096 MiB**, compute threads
+**10**, and I/O lanes **1, 4, 8**, with two untraced repetitions of the same
+cold/hot protocol. It adds exactly two `--io-trace` diagnostics at eight lanes,
+bracketed by the untraced eight-lane controls. It does not enable compute traces,
+overlap, prefetch, or change the model, prompt, token count, context, or ubatch.
+
+The primary timer already exists inside serial `load_layer`: after staging,
+immediately before reads are dispatched, through completion of every demand
+job, before eviction. Report `sum(aligned read_bytes) / sum(read-phase wall)`;
+do not divide by token wall, average per-layer bandwidth ratios, or sum parallel
+worker durations. Empty-batch timer overhead remains in the primary denominator.
+Reader-interval unions are secondary evidence and exclude zero-read groups.
+
+The [consolidated test report](docs/experiment/DeepSeek-V2-Lite-多主机内存线程与存储性能测试.md)
+contains eight newly completed processes and public aggregates. At eight lanes,
+untraced pooled loading rate was 2.809 GB/s; the two reader-interval union rates
+were 2.806 and 2.805 GB/s. These are workload-specific loading rates including
+bounce copies, not independent physical NVMe bandwidth measurements.
+
+The subsequently requested **four-compute-thread** variant fixes `-t 4`,
+cache 4096 MiB, and I/O lanes 1/4/8, with two untraced repetitions each. It runs
+actual model generation; no synthetic I/O workload supplies its measurements.
+The [four-thread inference section](docs/experiment/DeepSeek-V2-Lite-多主机内存线程与存储性能测试.md)
+keeps loading-window bandwidth separate from read traffic averaged over decode
+windows including computation. Its one-lane repetitions differ substantially;
+retain both values rather than quoting the pooled value as typical performance.
+
+`--io-threads N` configures software read lanes, not PCIe lanes, NAND channels,
+or a guaranteed one-thread/one-NVMe-queue mapping. In serial mode lane 0 belongs
+to the caller and N-1 lanes have background workers. Copies into expert buffers
+are RAM writes, not model-file writes to the storage device.
+
+### External read-only fio reference
+
+The separately user-authorized external comparison uses installed fio 3.28 on
+the same system-NVMe model file, with `--readonly`, `direct=1`, no file creation,
+and no write/trim workload. It does not replace real inference measurements.
+The two profiles are 1 MiB sequential `libaio` at QD32, and 1,626,112-byte random
+`psync` reads at QD1 per worker with 1/4/8 workers. Each runs twice for 20 seconds
+after a 3-second ramp, with fixed distinct random seeds per worker.
+
+The [consolidated fio comparison](docs/experiment/DeepSeek-V2-Lite-多主机内存线程与存储性能测试.md)
+records eight validated runs, unchanged model hashes, and zero fio write/trim
+bytes. Sequential throughput was 4.783 GB/s; random four/eight-worker throughput
+was 4.627/4.778 GB/s, versus 2.616/2.807 GB/s in four-compute-thread inference.
+Continuous fio submission, random offsets, and different memory destinations
+make this an external reference, not a router replay or strict hardware ceiling.
+Do not assign the gap to one mechanism without further evidence. Grouped psync
+depth-1 statistics are per worker, not the aggregate device queue depth.
 
 ## Mmap block-layer traffic
 
@@ -665,7 +743,7 @@ that drop, so a hot turn's prefill is zero only when those pages are still resid
 
 The invocation, the host labels, and the rule that this is one of only two allowed modes
 are under [Allowed test modes](#allowed-test-modes). Full tables:
-[Jetson AGX mmap record](docs/experiment/2026-09-21-jetson-agx-mmap-q4-0.md). The board build
+[consolidated experiment record](docs/experiment/DeepSeek-V2-Lite-多主机内存线程与存储性能测试.md). The board build
 (CPU only, `GGML_NATIVE=OFF`, `-march=armv8.2-a+fp16`) is in that file.
 
 Report load, the hot turn's prefill total, and hot decode MiB/token. On 2026-09-22, engine still

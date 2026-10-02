@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## Research documentation - 2026-10-02
+
+This section records experiment documentation only; it is not a software release.
+
+- **12-core ARM64 cache/thread heatmaps (2026-09-27).** Recorded 210 validated
+  CPU-only DeepSeek-V2-Lite pure-Q4_0 runs across 4/8/16 GiB expert-cache budgets,
+  with three numeric heatmap matrices and public aggregate evidence. Documented
+  read-phase scaling, thread count versus CPU work, CPU-residual limits, expert-size/bandwidth ideal
+  time comparisons, and the unavailable process block-I/O counter on this host.
+  Added an eight-run direct-timer follow-up with untraced controls and reader-window
+  union checks, measuring approximately 2.81 GB/s at eight I/O lanes.
+  Added the four-compute-thread real-inference follow-up at 4 GiB expert cache,
+  retaining the large one-lane variation and distinguishing software read lanes
+  from physical channels and loading rate from decode-average read traffic.
+  Added the separately authorized read-only fio comparison (2026-09-28): eight
+  validated runs on the same system-NVMe model file, approximately 4.78 GB/s
+  external read throughput, and explicit workload limits when comparing it
+  with real inference's approximately 2.81 GB/s expert-loading rate.
+  Consolidated the dated experiment records into one Chinese report. Inlined
+  the 12-core heatmap matrices, key fio per-run bytes and times, and historical
+  mmap/x86 comparisons; local PNG/CSV artifacts are ignored.
+  This documentation update changes no inference behavior.
+
 ## [0.24.0] - 2026-09-07
 
 ### Added

@@ -24,6 +24,9 @@ cmake-build-*/
 # Scratch notes and raw run samples at the root. Curated CSVs live in docs/bench-data/.
 /*.csv
 /NEXT-SESSION-PROMPT.md
+/outputs/
+/docs/experiment/*
+!/docs/experiment/DeepSeek-V2-Lite-多主机内存线程与存储性能测试.md
 
 # Android
 examples/android/.gradle/

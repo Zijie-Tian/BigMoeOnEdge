@@ -42,9 +42,8 @@ for the idea the project is built on.
 | [community-benchmarks.md](community-benchmarks.md) | Results on hardware we do not own, the one-command protocol (`scripts/bench-report.sh`), and how to submit a row. |
 | [warmup-analysis.md](warmup-analysis.md) | Why first tokens are slow, and the two regimes behind it. |
 | [cpu-profiling-findings.md](cpu-profiling-findings.md) | Host CPU / cgroup-v2 retrospective: tiny-fixture identity, a misleading undersized-cache run, warm replay, synthetic caps, and DeepSeek-V2-Lite. Not a phone benchmark. |
-| [experiment/2026-09-21-jetson-agx-mmap-q4-0.md](experiment/2026-09-21-jetson-agx-mmap-q4-0.md) | Jetson AGX mmap vs O_DIRECT streaming, DeepSeek-V2-Lite pure Q4_0, three kernel `mem=` caps. Hot mmap is the headline. The 2026-09-22 section is the block-layer byte measurement: hot decode 0 / 0.36 / 426.25 MiB/token. |
 | [experiments/moehit.md](experiments/moehit.md) | Expert-cache sweep, 0–28 GiB, on one ~30 GiB AGX. Mixtral-8x7B, DeepSeek-V2-Lite, Qwen1.5-MoE-A2.7B, and Qwen2-57B-A14B, all pure Q4_0. |
-| [experiment/2026-09-27-x86-thread-bottleneck.md](experiment/2026-09-27-x86-thread-bottleneck.md) | Serial O_DIRECT on one dual-socket x86 host. DeepSeek-V2-Lite pure Q4_0 at cache 0, 4 GiB, and 8 GiB. Includes the cache-0 compute-thread by I/O-lane heatmap. |
+| [DeepSeek 多主机实验汇总](experiment/DeepSeek-V2-Lite-多主机内存线程与存储性能测试.md) | 一份中文报告，整合三台 8 核主机的映射与区块读取、双路 x86 的线程实验、12 核主机的三档缓存矩阵、真实推理加载以及同盘 `fio` 基准；关键数据直接列在文中。 |
 | [bench-data/](bench-data/) | Raw per-run CSVs and session notes. A dated archive — see its README. |
 
 Every benchmark figure in these docs is measured on the hardware named beside it. If you
